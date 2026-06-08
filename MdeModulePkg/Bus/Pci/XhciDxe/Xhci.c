@@ -208,7 +208,7 @@ XhcReset (
       // Clean up the asynchronous transfers, currently only
       // interrupt supports asynchronous operation.
       //
-      XhciDelAllAsyncIntTransfers (Xhc);
+      XhciDelAllAsyncTransfers (Xhc);
       XhcFreeSched (Xhc);
 
       XhcInitSched (Xhc);
@@ -782,7 +782,7 @@ XhcTransfer (
   EFI_STATUS  RecoveryStatus;
   URB         *Urb;
 
-  ASSERT ((Type == XHC_CTRL_TRANSFER) || (Type == XHC_BULK_TRANSFER) || (Type == XHC_INT_TRANSFER_SYNC));
+  ASSERT ((Type == XHC_CTRL_TRANSFER) || (Type == XHC_BULK_TRANSFER) || (Type == XHC_INT_TRANSFER_SYNC) || (Type == XHC_ISO_TRANSFER_SYNC));
   Urb = XhcCreateUrb (
           Xhc,
           DeviceAddress,
@@ -1444,7 +1444,7 @@ XhcAsyncInterruptTransfer (
       goto ON_EXIT;
     }
 
-    Status = XhciDelAsyncIntTransfer (Xhc, DeviceAddress, EndPointAddress);
+    Status = XhciDelAsyncTransfer (Xhc, DeviceAddress, EndPointAddress);
     DEBUG ((DEBUG_INFO, "XhcAsyncInterruptTransfer: remove old transfer for addr %d, Status = %r\n", DeviceAddress, Status));
     goto ON_EXIT;
   }
@@ -1465,13 +1465,16 @@ XhcAsyncInterruptTransfer (
     goto ON_EXIT;
   }
 
-  Urb = XhciInsertAsyncIntTransfer (
+  Urb = XhciInsertAsyncTransfer (
           Xhc,
           DeviceAddress,
           EndPointAddress,
           DeviceSpeed,
           MaximumPacketLength,
+          XHC_INT_TRANSFER_ASYNC,
+          NULL,
           DataLength,
+          0,
           CallBackFunction,
           Context
           );
@@ -1640,7 +1643,134 @@ XhcIsochronousTransfer (
   OUT    UINT32                              *TransferResult
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_XHCI_INSTANCE  *Xhc;
+  UINT8              SlotId;
+  EFI_STATUS         Status;
+  EFI_TPL            OldTpl;
+  UINTN              TimeoutUs;
+  UINTN              TimeoutMs;
+  UINT32             Interval;
+  UINTN              FrameTime;
+  UINT8              Dci;
+
+  if ((DataLength == 0) || (Data == NULL) ||
+      (TransferResult == NULL))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if ((DeviceSpeed != EFI_USB_SPEED_FULL) &&
+      (DeviceSpeed != EFI_USB_SPEED_HIGH) &&
+      (DeviceSpeed != EFI_USB_SPEED_SUPER))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if ((MaximumPacketLength == 0) ||
+      ((DeviceSpeed == EFI_USB_SPEED_FULL) && (MaximumPacketLength > 1023)) ||
+      ((DeviceSpeed == EFI_USB_SPEED_HIGH) && (MaximumPacketLength > 1024)) ||
+      ((DeviceSpeed == EFI_USB_SPEED_SUPER) && (MaximumPacketLength > 1024)))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (XHC_TPL);
+
+  Xhc = XHC_FROM_THIS (This);
+
+  *TransferResult = EFI_USB_ERR_SYSTEM;
+  Status          = EFI_DEVICE_ERROR;
+
+  if (XhcIsHalt (Xhc) || XhcIsSysError (Xhc)) {
+    DEBUG ((DEBUG_ERROR, "XhcIsochronousTransfer: HC is halt\n"));
+    goto ON_EXIT;
+  }
+
+  SlotId = XhcBusDevAddrToSlotId (Xhc, DeviceAddress);
+  if (SlotId == 0) {
+    goto ON_EXIT;
+  }
+
+  if (DeviceSpeed == EFI_USB_SPEED_FULL) {
+    FrameTime = 1000;
+  } else if (DeviceSpeed == EFI_USB_SPEED_HIGH) {
+    FrameTime = 125;
+  } else if (DeviceSpeed == EFI_USB_SPEED_SUPER) {
+    FrameTime = 125;
+  }
+
+  Dci = XhcEndpointToDci (EndPointAddress, (UINT8)(((EndPointAddress & 0x80) != 0) ? EfiUsbDataIn : EfiUsbDataOut));
+
+  //
+  // Read the endpoint Interval from the Device Context
+  //
+  if (Xhc->HcCParams.Data.Csz == 0) {
+    Interval = 1 << ((DEVICE_CONTEXT *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  } else {
+    Interval = 1 << ((DEVICE_CONTEXT_64 *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  }
+
+  if (Interval == 0) {
+    Interval = 1;
+  }
+
+  TimeoutUs = Interval * FrameTime * 2;
+  TimeoutMs = (TimeoutUs + (XHC_1_MILLISECOND - 1)) / XHC_1_MILLISECOND;
+  if (TimeoutMs < XHC_SYNC_ISO_TIMEOUT_FLOOR) {
+    TimeoutMs = XHC_SYNC_ISO_TIMEOUT_FLOOR;
+  }
+
+  DEBUG ((DEBUG_INFO, "XhcIsochronousTransfer: Interval = %u, FrameTime = %u us, Timeout = %u us (%u ms)\n", (UINT32)Interval, (UINT32)FrameTime, (UINT32)TimeoutUs, (UINT32)TimeoutMs));
+
+  Status = XhcTransfer (
+             Xhc,
+             DeviceAddress,
+             EndPointAddress,
+             DeviceSpeed,
+             MaximumPacketLength,
+             XHC_ISO_TRANSFER_SYNC,
+             NULL,
+             Data[0],
+             &DataLength,
+             TimeoutMs,
+             TransferResult
+             );
+
+ON_EXIT:
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "XhcIsochronousTransfer: error - %r, transfer - %x\n", Status, *TransferResult));
+  }
+
+  gBS->RestoreTPL (OldTpl);
+
+  return Status;
+}
+
+/**
+  Determine whether a frame number is within the [Start, End] valid scheduling
+  window modulo 2048, per XHCI 1.1 Section 4.11.2.5. The window wraps if
+  Start > End.
+
+  @param Frame   Frame number to test (must be < 2048).
+  @param Start   First frame in the window, inclusive (< 2048).
+  @param End     Last frame in the window, inclusive (< 2048).
+
+  @retval TRUE   Frame is inside the window.
+  @retval FALSE  Frame is outside the window.
+**/
+STATIC
+BOOLEAN
+FrameInWindow (
+  IN UINT32  Frame,
+  IN UINT32  Start,
+  IN UINT32  End
+  )
+{
+  if (Start <= End) {
+    return (BOOLEAN)((Frame >= Start) && (Frame <= End));
+  }
+
+  return (BOOLEAN)((Frame >= Start) || (Frame <= End));
 }
 
 /**
@@ -1682,7 +1812,284 @@ XhcAsyncIsochronousTransfer (
   IN     VOID                                *Context
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_XHCI_INSTANCE  *Xhc;
+  UINT8              SlotId;
+  EFI_STATUS         Status;
+  EFI_TPL            OldTpl;
+  UINT32             Interval;
+  UINTN              FrameTime;
+  UINT8              Dci;
+  UINT32             FrameIndex;
+  UINTN              NumTransfers;
+  UINT32             FrameId;
+  UINT32             IsochronousSchedulingThreshold;
+  UINT32             StartFrameId;
+  UINT32             EndFrameId;
+  UINT32             Index;
+  URB                *Urb;
+  LIST_ENTRY         *Entry;
+  LIST_ENTRY         *Next;
+  UINT32             LastUrbFrameId;
+  BOOLEAN            HasPendingUrb;
+  URB                **Inserted;
+  UINTN              InsertedCount;
+  UINTN              RollbackIndex;
+  UINT32             IntervalFrames;
+  UINT32             Rem;
+  UINT32             FrameInFrames;
+  URB_BURST          *Burst;
+
+  HasPendingUrb  = FALSE;
+  LastUrbFrameId = 0;
+  Inserted       = NULL;
+  InsertedCount  = 0;
+  Burst          = NULL;
+
+  //
+
+  if ((DataLength == 0) || (Data == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if ((DeviceSpeed != EFI_USB_SPEED_FULL) &&
+      (DeviceSpeed != EFI_USB_SPEED_HIGH) &&
+      (DeviceSpeed != EFI_USB_SPEED_SUPER))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if ((MaximumPacketLength == 0) ||
+      ((DeviceSpeed == EFI_USB_SPEED_FULL) && (MaximumPacketLength > 1023)) ||
+      ((DeviceSpeed == EFI_USB_SPEED_HIGH) && (MaximumPacketLength > 1024)) ||
+      ((DeviceSpeed == EFI_USB_SPEED_SUPER) && (MaximumPacketLength > 1024)))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (XHC_TPL);
+
+  Xhc    = XHC_FROM_THIS (This);
+  Status = EFI_SUCCESS;
+
+  if (XhcIsHalt (Xhc) || XhcIsSysError (Xhc)) {
+    DEBUG ((DEBUG_ERROR, "XhcIsochronousTransfer: HC is halt\n"));
+    Status = EFI_DEVICE_ERROR;
+    goto ON_EXIT;
+  }
+
+  SlotId = XhcBusDevAddrToSlotId (Xhc, DeviceAddress);
+  if (SlotId == 0) {
+    Status = EFI_DEVICE_ERROR;
+    goto ON_EXIT;
+  }
+
+  if (DeviceSpeed == EFI_USB_SPEED_FULL) {
+    FrameTime = 1000;
+  } else if (DeviceSpeed == EFI_USB_SPEED_HIGH) {
+    FrameTime = 125;
+  } else if (DeviceSpeed == EFI_USB_SPEED_SUPER) {
+    FrameTime = 125;
+  }
+
+  NumTransfers = 1;
+  if (DataLength > MaximumPacketLength) {
+    NumTransfers = DataLength / MaximumPacketLength;
+
+    if (NumTransfers * MaximumPacketLength < DataLength) {
+      NumTransfers++;
+    }
+  }
+
+  if (NumTransfers > XHC_END_FRAME_OFFSET) {
+    DEBUG ((DEBUG_ERROR, "%a: number of transfers %u exceeds the max limit %u\n", __func__, (UINT32)NumTransfers, XHC_END_FRAME_OFFSET));
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Inserted = AllocatePool (NumTransfers * sizeof (URB *));
+  if (Inserted == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Burst = AllocateZeroPool (sizeof (URB_BURST));
+  if (Burst == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Burst->TotalUrbs           = (UINT32)NumTransfers;
+  Burst->RemainingUrbs       = (UINT32)NumTransfers;
+  Burst->AggregatedCompleted = 0;
+  Burst->AggregatedResult    = EFI_USB_NOERROR;
+  Burst->UserCallback        = IsochronousCallBack;
+  Burst->UserContext         = Context;
+
+  IsochronousSchedulingThreshold = Xhc->HcSParams2.Data.Ist;
+
+  // If IST is defined in microframes we round it to frames
+  if ((IsochronousSchedulingThreshold & 0x8) == 0) {
+    IsochronousSchedulingThreshold = (IsochronousSchedulingThreshold + 4) >> 3;
+  }
+
+  Dci = XhcEndpointToDci (EndPointAddress, (UINT8)(((EndPointAddress & 0x80) != 0) ? EfiUsbDataIn : EfiUsbDataOut));
+
+  //
+  // Read the endpoint Interval from the Device Context
+  //
+  if (Xhc->HcCParams.Data.Csz == 0) {
+    Interval = 1 << ((DEVICE_CONTEXT *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  } else {
+    Interval = 1 << ((DEVICE_CONTEXT_64 *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  }
+
+  if (Interval == 0) {
+    Interval = 1;
+  }
+
+  //
+  // Check if there is any pending async isochronous transfer for the same endpoint,
+  // if yes, schedule the new transfer after the last pending transfer.
+  //
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
+    Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
+    DEBUG ((DEBUG_INFO, "%a: pending Urb - DevAddr: %d, EpAddr: 0x%02x, Type: %d, FrameId: %u\n", __func__, Urb->Ep.DevAddr, Urb->Ep.EpAddr, Urb->Ep.Type, Urb->FrameId));
+    if ((Urb->Ep.Type == XHC_ISO_TRANSFER_ASYNC) &&
+        (Urb->Ep.EpAddr == EndPointAddress) &&
+        (Urb->Ep.BusAddr == DeviceAddress))
+    {
+      LastUrbFrameId = Urb->FrameId;
+      HasPendingUrb  = TRUE;
+      break;
+    }
+  }
+
+  //
+  // Calculate Valid Frame Window
+  // See XHCI Spec 1.1 Section 4.11.2.5.
+  // XHC_END_FRAME_OFFSET and StartFrameId are in frames; Interval is in microframes.
+  //
+  FrameIndex   = XhcReadRuntimeReg (Xhc, XHC_MFINDEX_OFFSET) >> 3;
+  EndFrameId   = (FrameIndex + XHC_END_FRAME_OFFSET) % 2048;
+  StartFrameId = (FrameIndex + IsochronousSchedulingThreshold + 1) % 2048;
+
+  IntervalFrames = Interval >> 3;
+  if (IntervalFrames > 1) {
+    Rem = StartFrameId % IntervalFrames;
+    if (Rem != 0) {
+      StartFrameId = (StartFrameId + IntervalFrames - Rem) % 2048;
+    }
+  }
+
+  if (HasPendingUrb && FrameInWindow (LastUrbFrameId >>  3, StartFrameId, EndFrameId)) {
+    DEBUG ((DEBUG_INFO, "%a: pending transfer with FrameId %u exists, scheduling after it\n", __func__, LastUrbFrameId));
+    FrameId = LastUrbFrameId + Interval;
+
+    if ((FrameId >> 3) >= 2048) {
+      FrameId = FrameId % (2048 << 3);
+    }
+  } else {
+    FrameId = StartFrameId << 3;
+  }
+
+  DEBUG ((DEBUG_INFO, "%a: Interval = %u, FrameTime = %u us, StartFrameId = %u, EndFrameId = %u, Queued Frame = %u, NumTransfers = %u\n", __func__, (UINT32)Interval, (UINT32)FrameTime, StartFrameId, EndFrameId, (UINT32)FrameId >> 3, (UINT32)NumTransfers));
+
+  for (Index = 0; Index < NumTransfers - 1; Index++) {
+    FrameInFrames = (FrameId >> 3) % 2048;
+    if (!FrameInWindow (FrameInFrames, StartFrameId, EndFrameId)) {
+      DEBUG ((DEBUG_ERROR, "%a: frame %u outside valid window [%u, %u]\n", __func__, FrameInFrames, StartFrameId, EndFrameId));
+      Status = EFI_OUT_OF_RESOURCES;
+      goto ON_EXIT;
+    }
+
+    Urb = XhciInsertAsyncTransfer (
+            Xhc,
+            DeviceAddress,
+            EndPointAddress,
+            DeviceSpeed,
+            MaximumPacketLength,
+            XHC_ISO_TRANSFER_ASYNC,
+            (UINT8 *)Data[0] + (Index * MaximumPacketLength),
+            MaximumPacketLength,
+            FrameId,
+            XhciBurstWrapperCallback,
+            Burst
+            );
+
+    FrameId += Interval;
+    if (Urb == NULL) {
+      Status = EFI_OUT_OF_RESOURCES;
+      goto ON_EXIT;
+    }
+
+    if ((FrameId >> 3) >= 2048) {
+      FrameId = FrameId % (2048 << 3);
+    }
+
+    Inserted[InsertedCount] = Urb;
+    InsertedCount++;
+  }
+
+  FrameInFrames = (FrameId >> 3) % 2048;
+  if (!FrameInWindow (FrameInFrames, StartFrameId, EndFrameId)) {
+    DEBUG ((DEBUG_ERROR, "%a: frame %u outside valid window [%u, %u]\n", __func__, FrameInFrames, StartFrameId, EndFrameId));
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Urb = XhciInsertAsyncTransfer (
+          Xhc,
+          DeviceAddress,
+          EndPointAddress,
+          DeviceSpeed,
+          MaximumPacketLength,
+          XHC_ISO_TRANSFER_ASYNC,
+          (UINT8 *)Data[0] + ((NumTransfers - 1) * MaximumPacketLength),
+          DataLength - ((NumTransfers - 1) * MaximumPacketLength),
+          FrameId,
+          XhciBurstWrapperCallback,
+          Burst
+          );
+
+  if (Urb == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Inserted[InsertedCount] = Urb;
+  InsertedCount++;
+
+  Status = RingIntTransferDoorBell (Xhc, Urb);
+
+ON_EXIT:
+  if (EFI_ERROR (Status) && (Inserted != NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: transfer failed, rolling back %u queued URBs\n", __func__, (UINT32)InsertedCount));
+    for (RollbackIndex = 0; RollbackIndex < InsertedCount; RollbackIndex++) {
+      Inserted[RollbackIndex]->Callback = NULL;
+      Inserted[RollbackIndex]->Context  = NULL;
+      XhcDequeueTrbFromEndpoint (Xhc, Inserted[RollbackIndex]);
+      RemoveEntryList (&Inserted[RollbackIndex]->UrbList);
+      XhcFreeUrb (Xhc, Inserted[RollbackIndex]);
+    }
+  }
+
+  if (Inserted != NULL) {
+    FreePool (Inserted);
+  }
+
+  if (EFI_ERROR (Status) && (Burst != NULL)) {
+    FreePool (Burst);
+    Burst = NULL;
+  }
+
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: error - %r\n", __func__, Status));
+  }
+
+  Xhc->PciIo->Flush (Xhc->PciIo);
+  gBS->RestoreTPL (OldTpl);
+
+  return Status;
 }
 
 /**
@@ -1839,7 +2246,7 @@ XhcCreateUsbHc (
     Xhc->Usb2Hc.MinorRevision = (ReleaseNumber & 0x0F);
   }
 
-  InitializeListHead (&Xhc->AsyncIntTransfers);
+  InitializeListHead (&Xhc->AsyncTransfers);
 
   //
   // Be caution that the Offset passed to XhcReadCapReg() should be Dword align
@@ -2285,7 +2692,7 @@ XhcDriverBindingStop (
 
   XhcHaltHC (Xhc, XHC_GENERIC_TIMEOUT);
   XhcClearBiosOwnership (Xhc);
-  XhciDelAllAsyncIntTransfers (Xhc);
+  XhciDelAllAsyncTransfers (Xhc);
   XhcFreeSched (Xhc);
 
   if (Xhc->ControllerNameTable) {

@@ -484,10 +484,96 @@ UsbIoIsochronousTransfer (
   IN  UINT8                DeviceEndpoint,
   IN  OUT VOID             *Data,
   IN  UINTN                DataLength,
-  OUT UINT32               *Status
+  OUT UINT32               *UsbStatus
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_DEVICE         *Dev;
+  USB_INTERFACE      *UsbIf;
+  USB_ENDPOINT_DESC  *EpDesc;
+  UINTN              NumTransfers;
+  EFI_TPL            OldTpl;
+  EFI_STATUS         Status;
+  INTN               FrameSize;
+  UINTN              Index;
+  VOID               *DataArray[EFI_USB_MAX_ISO_BUFFER_NUM];
+
+  if ((USB_ENDPOINT_ADDR (DeviceEndpoint) == 0) || (USB_ENDPOINT_ADDR (DeviceEndpoint) > 15) ||
+      (UsbStatus == NULL))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_BUS_TPL);
+
+  UsbIf = USB_INTERFACE_FROM_USBIO (This);
+  Dev   = UsbIf->Device;
+
+  EpDesc = UsbGetEndpointDesc (UsbIf, DeviceEndpoint);
+
+  if ((EpDesc == NULL) || (USB_ENDPOINT_TYPE (&EpDesc->Desc) != USB_ENDPOINT_ISO)) {
+    Status = EFI_INVALID_PARAMETER;
+    goto ON_EXIT;
+  }
+
+  FrameSize = 1023;
+  if ((Dev->Speed == EFI_USB_SPEED_HIGH) || (Dev->Speed == EFI_USB_SPEED_SUPER)) {
+    FrameSize = 1024;
+  }
+
+  if ((EpDesc->Desc.MaxPacketSize < FrameSize) && (EpDesc->Desc.MaxPacketSize != 0)) {
+    FrameSize = EpDesc->Desc.MaxPacketSize & 0x7FF;
+  }
+
+  NumTransfers = 1;
+  if (DataLength > FrameSize) {
+    NumTransfers = DataLength / FrameSize;
+
+    if (NumTransfers * FrameSize < DataLength) {
+      NumTransfers++;
+    }
+  }
+
+  for (Index = 0; Index < NumTransfers - 1; Index++) {
+    DEBUG ((DEBUG_INFO, "UsbIoIsochronousTransfer: DataLength = %d, FrameSize = %d\n", DataLength, FrameSize));
+
+    DataArray[0] = (UINT8 *)Data + Index * FrameSize;
+
+    Status = UsbHcIsochronousTransfer (
+               Dev->Bus,
+               Dev->Address,
+               DeviceEndpoint,
+               Dev->Speed,
+               FrameSize,
+               1,
+               DataArray,
+               FrameSize,
+               &Dev->Translator,
+               UsbStatus
+               );
+
+    if (EFI_ERROR (Status) || (*UsbStatus != EFI_USB_NOERROR)) {
+      goto ON_EXIT;
+    }
+  }
+
+  DataArray[0] = (UINT8 *)Data + Index * FrameSize;
+
+  Status = UsbHcIsochronousTransfer (
+             Dev->Bus,
+             Dev->Address,
+             DeviceEndpoint,
+             Dev->Speed,
+             FrameSize,
+             1,
+             DataArray,
+             DataLength - ((NumTransfers - 1) * FrameSize),
+             &Dev->Translator,
+             UsbStatus
+             );
+
+ON_EXIT:
+  gBS->RestoreTPL (OldTpl);
+  return Status;
 }
 
 /**
@@ -515,7 +601,48 @@ UsbIoAsyncIsochronousTransfer (
   IN VOID                             *Context              OPTIONAL
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_DEVICE         *Dev;
+  USB_INTERFACE      *UsbIf;
+  USB_ENDPOINT_DESC  *EpDesc;
+  EFI_TPL            OldTpl;
+  EFI_STATUS         Status;
+  VOID               *DataArray[EFI_USB_MAX_ISO_BUFFER_NUM];
+
+  if ((USB_ENDPOINT_ADDR (DeviceEndpoint) == 0) || (USB_ENDPOINT_ADDR (DeviceEndpoint) > 15)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_BUS_TPL);
+
+  UsbIf = USB_INTERFACE_FROM_USBIO (This);
+  Dev   = UsbIf->Device;
+
+  EpDesc = UsbGetEndpointDesc (UsbIf, DeviceEndpoint);
+
+  if ((EpDesc == NULL) || (USB_ENDPOINT_TYPE (&EpDesc->Desc) != USB_ENDPOINT_ISO)) {
+    Status = EFI_INVALID_PARAMETER;
+    goto ON_EXIT;
+  }
+
+  DataArray[0] = Data;
+
+  Status = UsbHcAsyncIsochronousTransfer (
+             Dev->Bus,
+             Dev->Address,
+             DeviceEndpoint,
+             Dev->Speed,
+             EpDesc->Desc.MaxPacketSize & 0x7ff,
+             1,
+             DataArray,
+             DataLength,
+             &Dev->Translator,
+             IsochronousCallBack,
+             Context
+             );
+
+ON_EXIT:
+  gBS->RestoreTPL (OldTpl);
+  return Status;
 }
 
 /**

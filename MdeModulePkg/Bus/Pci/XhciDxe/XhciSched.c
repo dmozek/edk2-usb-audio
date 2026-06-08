@@ -175,10 +175,83 @@ XhcCreateUrb (
   Urb->DataLen  = DataLen;
   Urb->Callback = Callback;
   Urb->Context  = Context;
+  Urb->FrameId  = -1;
 
   Status = XhcCreateTransferTrb (Xhc, Urb);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "XhcCreateUrb: XhcCreateTransferTrb Failed, Status = %r\n", Status));
+    FreePool (Urb);
+    Urb = NULL;
+  }
+
+  return Urb;
+}
+
+/**
+  Create a new URB for a new isochronous transaction.
+
+  @param  Xhc       The XHCI Instance
+  @param  BusAddr   The logical device address assigned by UsbBus driver
+  @param  EpAddr    Endpoint addrress
+  @param  DevSpeed  The device speed
+  @param  MaxPacket The max packet length of the endpoint
+  @param  Type      The transaction type
+  @param  FrameId   The Frame Id the URB should be scheduled with for isochronous transfer
+  @param  Request   The standard USB request for control transfer
+  @param  Data      The user data to transfer
+  @param  DataLen   The length of data buffer
+  @param  Callback  The function to call when data is transferred
+  @param  Context   The context to the callback
+
+  @return Created URB or NULL
+
+**/
+URB *
+XhcCreateIsochUrb (
+  IN USB_XHCI_INSTANCE                *Xhc,
+  IN UINT8                            BusAddr,
+  IN UINT8                            EpAddr,
+  IN UINT8                            DevSpeed,
+  IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN INT32                            FrameId,
+  IN EFI_USB_DEVICE_REQUEST           *Request,
+  IN VOID                             *Data,
+  IN UINTN                            DataLen,
+  IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
+  IN VOID                             *Context
+  )
+{
+  USB_ENDPOINT  *Ep;
+  EFI_STATUS    Status;
+  URB           *Urb;
+
+  Urb = AllocateZeroPool (sizeof (URB));
+  if (Urb == NULL) {
+    return NULL;
+  }
+
+  Urb->Signature = XHC_URB_SIG;
+  InitializeListHead (&Urb->UrbList);
+
+  Ep            = &Urb->Ep;
+  Ep->BusAddr   = BusAddr;
+  Ep->EpAddr    = (UINT8)(EpAddr & 0x0F);
+  Ep->Direction = ((EpAddr & 0x80) != 0) ? EfiUsbDataIn : EfiUsbDataOut;
+  Ep->DevSpeed  = DevSpeed;
+  Ep->MaxPacket = MaxPacket;
+  Ep->Type      = Type;
+
+  Urb->Request  = Request;
+  Urb->Data     = Data;
+  Urb->DataLen  = DataLen;
+  Urb->Callback = Callback;
+  Urb->Context  = Context;
+  Urb->FrameId  = FrameId;
+
+  Status = XhcCreateTransferTrb (Xhc, Urb);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "XhcCreateIsochUrb: XhcCreateTransferTrb Failed, Status = %r\n", Status));
     FreePool (Urb);
     Urb = NULL;
   }
@@ -237,6 +310,9 @@ XhcCreateTransferTrb (
   UINTN                          TotalLen;
   UINTN                          Len;
   UINTN                          TrbNum;
+  UINTN                          TdPacketCount;
+  UINTN                          IsochBurstResiduePackets;
+  UINTN                          IsochMaxBurstSize;
   EFI_PCI_IO_PROTOCOL_OPERATION  MapOp;
   EFI_PHYSICAL_ADDRESS           PhyAddr;
   VOID                           *Map;
@@ -448,6 +524,87 @@ XhcCreateTransferTrb (
         TrbStart->TrbNormal.TDSize    = 0;
         TrbStart->TrbNormal.IntTarget = 0;
         TrbStart->TrbNormal.ISP       = 1;
+        TrbStart->TrbNormal.IOC       = 1;
+        TrbStart->TrbNormal.Type      = TRB_TYPE_NORMAL;
+        //
+        // Update the cycle bit
+        //
+        TrbStart->TrbNormal.CycleBit = EPRing->RingPCS & BIT0;
+
+        XhcSyncTrsRing (Xhc, EPRing);
+        TrbNum++;
+        TotalLen += Len;
+      }
+
+      Urb->TrbNum = TrbNum;
+      Urb->TrbEnd = (TRB_TEMPLATE *)(UINTN)TrbStart;
+      break;
+
+    case ED_ISOCH_IN:
+    case ED_ISOCH_OUT:
+      TotalLen = 0;
+      Len      = 0;
+      TrbNum   = 0;
+      TrbStart = (TRB *)(UINTN)EPRing->RingEnqueue;
+
+      IsochMaxBurstSize = (Urb->Ep.MaxPacket & 0x1800) >> 11;
+
+      //
+      // Create Isoch TRB
+      //
+
+      TdPacketCount = (Urb->DataLen + Urb->Ep.MaxPacket - 1) / Urb->Ep.MaxPacket;
+      if (Urb->DataLen >= 0x10000) {
+        Len = 0x10000;
+      } else {
+        Len = Urb->DataLen;
+      }
+
+      IsochBurstResiduePackets = TdPacketCount % (IsochMaxBurstSize + 1);
+
+      TrbStart                     = (TRB *)(UINTN)EPRing->RingEnqueue;
+      TrbStart->TrbIsoch.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy);
+      TrbStart->TrbIsoch.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy);
+      TrbStart->TrbIsoch.Length    = (UINT32)Len;
+      TrbStart->TrbIsoch.TDSize    = 0;
+      TrbStart->TrbIsoch.IntTarget = 0;
+      TrbStart->TrbIsoch.ISP       = 1;
+      TrbStart->TrbIsoch.IOC       = 1;
+      TrbStart->TrbIsoch.CH        = (Urb->DataLen > Len) ? 1 : 0;
+      TrbStart->TrbIsoch.TBC       = ((TdPacketCount + (IsochMaxBurstSize)) / (IsochMaxBurstSize + 1)) - 1;
+      TrbStart->TrbIsoch.BEI       = 0;
+      TrbStart->TrbIsoch.Type      = TRB_TYPE_ISOCH;
+      TrbStart->TrbIsoch.TLBPC     =  IsochBurstResiduePackets == 0 ? IsochMaxBurstSize : IsochBurstResiduePackets - 1;
+      TrbStart->TrbIsoch.FrameId   = Urb->FrameId < 0 ? 0 : (UINT16)(Urb->FrameId >> 3);
+      TrbStart->TrbIsoch.SIA       = Urb->FrameId < 0 ? 1 : 0;
+      TrbStart->TrbIsoch.IDT       = 0;
+      //
+      // Update the cycle bit
+      //
+      TrbStart->TrbIsoch.CycleBit = EPRing->RingPCS & BIT0;
+
+      XhcSyncTrsRing (Xhc, EPRing);
+      TrbNum++;
+      TotalLen += Len;
+
+      //
+      // If Data > 64K, chain normal TRBs
+      //
+      while (TotalLen < Urb->DataLen) {
+        if ((TotalLen + 0x10000) >= Urb->DataLen) {
+          Len = Urb->DataLen - TotalLen;
+        } else {
+          Len = 0x10000;
+        }
+
+        TrbStart                      = (TRB *)(UINTN)EPRing->RingEnqueue;
+        TrbStart->TrbNormal.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+        TrbStart->TrbNormal.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+        TrbStart->TrbNormal.Length    = (UINT32)Len;
+        TrbStart->TrbNormal.TDSize    = 0;
+        TrbStart->TrbNormal.IntTarget = 0;
+        TrbStart->TrbNormal.ISP       = 1;
+        TrbStart->TrbNormal.CH        = ((TotalLen + Len) < Urb->DataLen) ? 1 : 0;
         TrbStart->TrbNormal.IOC       = 1;
         TrbStart->TrbNormal.Type      = TRB_TYPE_NORMAL;
         //
@@ -1074,7 +1231,7 @@ IsTransferRingTrb (
 
 **/
 BOOLEAN
-IsAsyncIntTrb (
+IsAsyncTrb (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  TRB_TEMPLATE       *Trb,
   OUT URB                **Urb
@@ -1084,7 +1241,7 @@ IsAsyncIntTrb (
   LIST_ENTRY  *Next;
   URB         *CheckedUrb;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     CheckedUrb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
     if (IsTransferRingTrb (Xhc, Trb, CheckedUrb)) {
       *Urb = CheckedUrb;
@@ -1093,6 +1250,210 @@ IsAsyncIntTrb (
   }
 
   return FALSE;
+}
+
+/**
+  Per-URB callback installed on every member of a multi-TRB async isoch
+  burst. Aggregates this URB's completion into the shared URB_BURST state
+  reached via Context, and forwards a single user-visible callback once the
+  final member URB has reported.
+
+  @param  Data         Unused (always NULL for isoch URBs).
+  @param  DataLength   Number of bytes this URB transferred.
+  @param  Context      Pointer to the shared URB_BURST for this submit.
+  @param  Status       This URB's USB result bitmask.
+**/
+EFI_STATUS
+EFIAPI
+XhciBurstWrapperCallback (
+  IN VOID    *Data,
+  IN UINTN   DataLength,
+  IN VOID    *Context,
+  IN UINT32  Status
+  )
+{
+  URB_BURST                        *Burst;
+  EFI_ASYNC_USB_TRANSFER_CALLBACK  UserCallback;
+  VOID                             *UserContext;
+  UINTN                            BurstCompleted;
+  UINT32                           BurstResult;
+
+  Burst = (URB_BURST *)Context;
+  if (Burst == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Burst->AggregatedCompleted += DataLength;
+  Burst->AggregatedResult    |= Status;
+  ASSERT (Burst->RemainingUrbs > 0);
+  Burst->RemainingUrbs--;
+
+  if (Burst->RemainingUrbs != 0) {
+    return EFI_SUCCESS;
+  }
+
+  UserCallback   = Burst->UserCallback;
+  UserContext    = Burst->UserContext;
+  BurstCompleted = Burst->AggregatedCompleted;
+  BurstResult    = Burst->AggregatedResult;
+
+  FreePool (Burst);
+
+  if (UserCallback != NULL) {
+    UserCallback (NULL, BurstCompleted, UserContext, BurstResult);
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Drop one member URB from its burst without firing the user callback. Used
+  when a URB is being torn down outside the normal completion path (e.g.
+  the EP ring is being reset by SetInterface and the user-supplied
+  Context/Callback are no longer valid).
+
+  @param  Burst         The burst from which to abandon a member URB.
+**/
+STATIC
+VOID
+XhciBurstWrapperAbandon (
+  IN URB_BURST  *Burst
+  )
+{
+  if (Burst == NULL) {
+    return;
+  }
+
+  ASSERT (Burst->RemainingUrbs > 0);
+  Burst->RemainingUrbs--;
+
+  if (Burst->RemainingUrbs == 0) {
+    FreePool (Burst);
+  }
+}
+
+/**
+  Remove every URB whose transfer-ring pointer matches Ring from Xhc->AsyncTransfers,
+  and free each.
+
+  @param  Xhc   The XHCI instance whose async list to prune.
+  @param  Ring  The transfer ring whose URBs to drop.
+**/
+VOID
+XhcRemoveAsyncTransfersForRing (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN TRANSFER_RING      *Ring
+  )
+{
+  LIST_ENTRY  *Entry;
+  LIST_ENTRY  *Next;
+  URB         *CheckedUrb;
+
+  if (Ring == NULL) {
+    return;
+  }
+
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
+    CheckedUrb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
+
+    if (CheckedUrb->Ring != Ring) {
+      continue;
+    }
+
+    if (CheckedUrb->Callback == XhciBurstWrapperCallback) {
+      XhciBurstWrapperAbandon ((URB_BURST *)CheckedUrb->Context);
+      CheckedUrb->Callback = NULL;
+      CheckedUrb->Context  = NULL;
+    }
+
+    RemoveEntryList (&CheckedUrb->UrbList);
+    XhcFreeUrb (Xhc, CheckedUrb);
+  }
+}
+
+/**
+  Reinitialize an already-allocated transfer ring without releasing its
+  memory.
+
+  @param  Xhc   The XHCI instance whose ring to reinit.
+  @param  Ring  The transfer ring to reinit.
+**/
+VOID
+XhcReinitializeTransferRing (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN TRANSFER_RING      *Ring
+  )
+{
+  LINK_TRB              *EndTrb;
+  EFI_PHYSICAL_ADDRESS  PhyAddr;
+
+  ASSERT (Ring != NULL);
+  ASSERT (Ring->RingSeg0 != NULL);
+
+  XhcRemoveAsyncTransfersForRing (Xhc, Ring);
+
+  ZeroMem (Ring->RingSeg0, sizeof (TRB_TEMPLATE) * Ring->TrbNumber);
+  Ring->RingEnqueue = (TRB_TEMPLATE *)Ring->RingSeg0;
+  Ring->RingDequeue = (TRB_TEMPLATE *)Ring->RingSeg0;
+  Ring->RingPCS     = 1;
+
+  //
+  // Reinstall the Link TRB at the tail of the ring (XHCI 4.9.2)
+  //
+  EndTrb           = (LINK_TRB *)((UINTN)Ring->RingSeg0 + sizeof (TRB_TEMPLATE) * (Ring->TrbNumber - 1));
+  EndTrb->Type     = TRB_TYPE_LINK;
+  PhyAddr          = UsbHcGetPciAddrForHostAddr (Xhc->MemPool, Ring->RingSeg0, sizeof (TRB_TEMPLATE) * Ring->TrbNumber, TRUE);
+  EndTrb->PtrLo    = XHC_LOW_32BIT (PhyAddr);
+  EndTrb->PtrHi    = XHC_HIGH_32BIT (PhyAddr);
+  EndTrb->TC       = 1;
+  EndTrb->CycleBit = 0;
+}
+
+/**
+  Mark every outstanding async isochronous URB on the (SlotId, Dci) endpoint
+  as Finished.
+
+  @param  Xhc         The XHCI instance whose async list to update.
+  @param  SlotId      The Slot ID of the endpoint whose URBs to complete.
+  @param  Dci         The Device Context Index of the endpoint whose URBs to complete.
+  @param  UrbResult   The result bitmask to apply to each completed URB's
+**/
+VOID
+XhcCompleteAsyncIsochUrbsOnEp (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN UINT8              SlotId,
+  IN UINT8              Dci,
+  IN UINT32             UrbResult
+  )
+{
+  LIST_ENTRY  *Entry;
+  LIST_ENTRY  *Next;
+  URB         *CheckedUrb;
+  UINT8       UrbSlotId;
+  UINT8       UrbDci;
+
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
+    CheckedUrb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
+
+    if ((CheckedUrb->Ep.Type != XHC_ISO_TRANSFER_ASYNC) || CheckedUrb->Finished) {
+      continue;
+    }
+
+    UrbSlotId = XhcBusDevAddrToSlotId (Xhc, CheckedUrb->Ep.BusAddr);
+    if (UrbSlotId != SlotId) {
+      continue;
+    }
+
+    UrbDci = XhcEndpointToDci (CheckedUrb->Ep.EpAddr, (UINT8)(CheckedUrb->Ep.Direction));
+    if (UrbDci != Dci) {
+      continue;
+    }
+
+    CheckedUrb->Result   |= UrbResult;
+    CheckedUrb->Finished  = TRUE;
+    CheckedUrb->StartDone = TRUE;
+    CheckedUrb->EndDone   = TRUE;
+  }
 }
 
 /**
@@ -1160,6 +1521,32 @@ XhcCheckUrbResult (
     }
 
     //
+    // Endpoint-level events (Missed Service / Ring Underrun / Ring Overrun)
+    // carry no meaningful TRB pointer (XHCI spec 4.11.3.1).
+    // Handle them up-front so they don't fall into
+    // the URB-matching block and get dropped.
+    //
+    if ((EvtTrb->Completecode == TRB_COMPLETION_MISSED_SERVICE_ERROR) ||
+        (EvtTrb->Completecode == TRB_COMPLETION_RING_UNDERRUN) ||
+        (EvtTrb->Completecode == TRB_COMPLETION_RING_OVERRUN))
+    {
+      DEBUG ((
+        DEBUG_VERBOSE,
+        "XhcCheckUrbResult: EP-level event code=0x%x SlotId=%d EpId=%d\n",
+        EvtTrb->Completecode,
+        EvtTrb->SlotId,
+        EvtTrb->EndpointId
+        ));
+      XhcCompleteAsyncIsochUrbsOnEp (
+        Xhc,
+        (UINT8)EvtTrb->SlotId,
+        (UINT8)EvtTrb->EndpointId,
+        EFI_USB_NOERROR
+        );
+      continue;
+    }
+
+    //
     // Need convert pci device address to host address
     //
     PhyAddr = (EFI_PHYSICAL_ADDRESS)(EvtTrb->TRBPtrLo | LShiftU64 ((UINT64)EvtTrb->TRBPtrHi, 32));
@@ -1175,9 +1562,13 @@ XhcCheckUrbResult (
       CheckedUrb = Xhc->PendingUrb;
     } else if (IsTransferRingTrb (Xhc, TRBPtr, Urb)) {
       CheckedUrb = Urb;
-    } else if (IsAsyncIntTrb (Xhc, TRBPtr, &AsyncUrb)) {
+    } else if (IsAsyncTrb (Xhc, TRBPtr, &AsyncUrb)) {
       CheckedUrb = AsyncUrb;
     } else {
+      continue;
+    }
+
+    if (CheckedUrb->Finished) {
       continue;
     }
 
@@ -1374,8 +1765,8 @@ XhcExecTransfer (
 }
 
 /**
-  Delete a single asynchronous interrupt transfer for
-  the device and endpoint.
+  Delete a single asynchronous interrupt or isochronous
+  transfer for the device and endpoint.
 
   @param  Xhc                   The XHCI Instance.
   @param  BusAddr               The logical device address assigned by UsbBus driver.
@@ -1386,7 +1777,7 @@ XhcExecTransfer (
 
 **/
 EFI_STATUS
-XhciDelAsyncIntTransfer (
+XhciDelAsyncTransfer (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  UINT8              BusAddr,
   IN  UINT8              EpNum
@@ -1396,6 +1787,7 @@ XhciDelAsyncIntTransfer (
   LIST_ENTRY              *Next;
   URB                     *Urb;
   VOID                    *UrbData;
+  BOOLEAN                 OwnsData;
   EFI_USB_DATA_DIRECTION  Direction;
   EFI_STATUS              Status;
 
@@ -1404,7 +1796,7 @@ XhciDelAsyncIntTransfer (
 
   Urb = NULL;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
     if ((Urb->Ep.BusAddr == BusAddr) &&
         (Urb->Ep.EpAddr == EpNum) &&
@@ -1416,17 +1808,19 @@ XhciDelAsyncIntTransfer (
       //
       Status = XhcDequeueTrbFromEndpoint (Xhc, Urb);
       if (EFI_ERROR (Status)) {
-        DEBUG ((DEBUG_ERROR, "XhciDelAsyncIntTransfer: XhcDequeueTrbFromEndpoint failed\n"));
+        DEBUG ((DEBUG_ERROR, "%a: XhcDequeueTrbFromEndpoint failed\n", __func__));
       }
 
       RemoveEntryList (&Urb->UrbList);
       //
-      // For `XhciDelAsyncIntTransfer`, the URB is created through `XhciInsertAsyncIntTransfer`
-      // and allocates and manages its own data buffer, so free it here.
+      // Only async-interrupt URBs own their data buffer (allocated by
+      // XhciInsertAsyncTransfer). For async-isochronous URBs the data buffer is
+      // supplied by the caller and must not be freed here.
       //
-      UrbData = Urb->Data;
+      UrbData  = Urb->Data;
+      OwnsData = (BOOLEAN)(Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC);
       XhcFreeUrb (Xhc, Urb);
-      if (UrbData != NULL) {
+      if (OwnsData && (UrbData != NULL)) {
         FreePool (UrbData);
       }
 
@@ -1438,13 +1832,13 @@ XhciDelAsyncIntTransfer (
 }
 
 /**
-  Remove all the asynchronous interrutp transfers.
+  Remove all the asynchronous interrutp and isochronous transfers.
 
   @param  Xhc    The XHCI Instance.
 
 **/
 VOID
-XhciDelAllAsyncIntTransfers (
+XhciDelAllAsyncTransfers (
   IN USB_XHCI_INSTANCE  *Xhc
   )
 {
@@ -1452,9 +1846,10 @@ XhciDelAllAsyncIntTransfers (
   LIST_ENTRY  *Next;
   URB         *Urb;
   VOID        *UrbData;
+  BOOLEAN     OwnsData;
   EFI_STATUS  Status;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
 
     //
@@ -1463,24 +1858,31 @@ XhciDelAllAsyncIntTransfers (
     //
     Status = XhcDequeueTrbFromEndpoint (Xhc, Urb);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "XhciDelAllAsyncIntTransfers: XhcDequeueTrbFromEndpoint failed\n"));
+      DEBUG ((DEBUG_ERROR, "XhciDelAllAsyncTransfers: XhcDequeueTrbFromEndpoint failed\n"));
     }
 
     RemoveEntryList (&Urb->UrbList);
+
+    if (Urb->Callback == XhciBurstWrapperCallback) {
+      XhciBurstWrapperAbandon ((URB_BURST *)Urb->Context);
+    }
+
     //
-    // For `XhciDelAllAsyncIntTransfers`, the URB is created through `XhciInsertAsyncIntTransfer`
-    // and allocates and manages its own data buffer, so free it here.
+    // Only async-interrupt URBs own their data buffer (allocated by
+    // XhciInsertAsyncTransfer). For async-isochronous URBs the data buffer is
+    // supplied by the caller and must not be freed here.
     //
-    UrbData = Urb->Data;
+    UrbData  = Urb->Data;
+    OwnsData = (BOOLEAN)(Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC);
     XhcFreeUrb (Xhc, Urb);
-    if (UrbData != NULL) {
+    if (OwnsData && (UrbData != NULL)) {
       FreePool (UrbData);
     }
   }
 }
 
 /**
-  Insert a single asynchronous interrupt transfer for
+  Insert a single asynchronous interrupt or isochronous transfer for
   the device and endpoint.
 
   @param Xhc            The XHCI Instance
@@ -1489,6 +1891,7 @@ XhciDelAllAsyncIntTransfers (
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
   @param DataLen        The length of data buffer
+  @param FrameId        The frame id for isochronous transfer
   @param Callback       The function to call when data is transferred
   @param Context        The context to the callback
 
@@ -1496,39 +1899,61 @@ XhciDelAllAsyncIntTransfers (
 
 **/
 URB *
-XhciInsertAsyncIntTransfer (
+XhciInsertAsyncTransfer (
   IN USB_XHCI_INSTANCE                *Xhc,
   IN UINT8                            BusAddr,
   IN UINT8                            EpAddr,
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN VOID                             *Data,
   IN UINTN                            DataLen,
+  IN INT32                            FrameId,
   IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
   IN VOID                             *Context
   )
 {
-  VOID  *Data;
-  URB   *Urb;
+  URB  *Urb;
 
-  Data = AllocateZeroPool (DataLen);
-  if (Data == NULL) {
-    DEBUG ((DEBUG_ERROR, "%a: failed to allocate buffer\n", __func__));
-    return NULL;
+  ASSERT (Type == XHC_INT_TRANSFER_ASYNC || Type == XHC_ISO_TRANSFER_ASYNC);
+
+  if (Type == XHC_INT_TRANSFER_ASYNC) {
+    Data = AllocateZeroPool (DataLen);
+    if (Data == NULL) {
+      DEBUG ((DEBUG_ERROR, "%a: failed to allocate buffer\n", __func__));
+      return NULL;
+    }
+
+    Urb = XhcCreateUrb (
+            Xhc,
+            BusAddr,
+            EpAddr,
+            DevSpeed,
+            MaxPacket,
+            XHC_INT_TRANSFER_ASYNC,
+            NULL,
+            Data,
+            DataLen,
+            Callback,
+            Context
+            );
+  } else {
+    Urb = XhcCreateIsochUrb (
+            Xhc,
+            BusAddr,
+            EpAddr,
+            DevSpeed,
+            MaxPacket,
+            Type,
+            FrameId,
+            NULL,
+            Data,
+            DataLen,
+            Callback,
+            Context
+            );
   }
 
-  Urb = XhcCreateUrb (
-          Xhc,
-          BusAddr,
-          EpAddr,
-          DevSpeed,
-          MaxPacket,
-          XHC_INT_TRANSFER_ASYNC,
-          NULL,
-          Data,
-          DataLen,
-          Callback,
-          Context
-          );
   if (Urb == NULL) {
     DEBUG ((DEBUG_ERROR, "%a: failed to create URB\n", __func__));
     FreePool (Data);
@@ -1539,7 +1964,7 @@ XhciInsertAsyncIntTransfer (
   // New asynchronous transfer must inserted to the head.
   // Check the comments in XhcMoniteAsyncRequests
   //
-  InsertHeadList (&Xhc->AsyncIntTransfers, &Urb->UrbList);
+  InsertHeadList (&Xhc->AsyncTransfers, &Urb->UrbList);
 
   return Urb;
 }
@@ -1654,7 +2079,9 @@ XhcMonitorAsyncRequests (
 
   Xhc = (USB_XHCI_INSTANCE *)Context;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  ProcBuf = NULL;
+
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     //
     // Save values passed into the callback.
     // `XhcUpdateAsyncRequest` must be called before the callback
@@ -1695,26 +2122,28 @@ XhcMonitorAsyncRequests (
       DEBUG ((DEBUG_ERROR, "XhcMonitorAsyncRequests: Fail to Flush AsyncInt Mapped Memeory\n"));
     }
 
-    //
-    // Allocate a buffer then copy the transferred data for user.
-    // If failed to allocate the buffer, update the URB for next
-    // round of transfer. Ignore the data of this round.
-    //
-    ProcBuf = NULL;
-    if (Urb->Result == EFI_USB_NOERROR) {
+    if (Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC) {
       //
-      // Make sure the data received from HW is no more than expected.
+      // Allocate a buffer then copy the transferred data for user.
+      // If failed to allocate the buffer, update the URB for next
+      // round of transfer. Ignore the data of this round.
       //
-      if (Urb->Completed <= Urb->DataLen) {
-        ProcBuf = AllocateZeroPool (Urb->Completed);
-      }
+      ProcBuf = NULL;
+      if (Urb->Result == EFI_USB_NOERROR) {
+        //
+        // Make sure the data received from HW is no more than expected.
+        //
+        if (Urb->Completed <= Urb->DataLen) {
+          ProcBuf = AllocateZeroPool (Urb->Completed);
+        }
 
-      if (ProcBuf == NULL) {
-        XhcUpdateAsyncRequest (Xhc, Urb);
-        continue;
-      }
+        if (ProcBuf == NULL) {
+          XhcUpdateAsyncRequest (Xhc, Urb);
+          continue;
+        }
 
-      CopyMem (ProcBuf, Urb->Data, Urb->Completed);
+        CopyMem (ProcBuf, Urb->Data, Urb->Completed);
+      }
     }
 
     //
@@ -1724,11 +2153,13 @@ XhcMonitorAsyncRequests (
     cbResult    = Urb->Result;
     cbContext   = Urb->Context;
 
-    //
-    // The update call must occur before the callback since the callback
-    // may remove and free the URB, leading to a fault.
-    //
-    XhcUpdateAsyncRequest (Xhc, Urb);
+    if (Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC) {
+      //
+      // The update call must occur before the callback since the callback
+      // may remove and free the URB, leading to a fault.
+      //
+      XhcUpdateAsyncRequest (Xhc, Urb);
+    }
 
     //
     // Leave error recovery to its related device driver. A
@@ -1752,6 +2183,16 @@ XhcMonitorAsyncRequests (
 
     if (ProcBuf != NULL) {
       gBS->FreePool (ProcBuf);
+      ProcBuf = NULL;
+    }
+
+    //
+    // Async isochronous URBs are one-shot: after the (last) callback fires,
+    // detach the URB from the list and free it.
+    //
+    if (Urb->Ep.Type == XHC_ISO_TRANSFER_ASYNC) {
+      RemoveEntryList (&Urb->UrbList);
+      XhcFreeUrb (Xhc, Urb);
     }
   }
   gBS->RestoreTPL (OldTpl);
@@ -2703,6 +3144,7 @@ XhcDisableSlotCmd (
   //
   for (Index = 0; Index < 31; Index++) {
     if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index] != NULL) {
+      XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index]);
       RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index])->RingSeg0;
       if (RingSeg != NULL) {
         UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -2816,6 +3258,7 @@ XhcDisableSlotCmd64 (
   //
   for (Index = 0; Index < 31; Index++) {
     if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index] != NULL) {
+      XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index]);
       RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index])->RingSeg0;
       if (RingSeg != NULL) {
         UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -3014,14 +3457,36 @@ XhcInitializeEndpointContext (
           InputContext->EP[Dci-1].EPType = ED_ISOCH_OUT;
         }
 
-        InputContext->EP[Dci-1].Interval = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].Interval         = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
 
-        //
-        // Do not support isochronous transfer now.
-        //
-        DEBUG ((DEBUG_INFO, "XhcInitializeEndpointContext: Unsupport ISO EP found, Transfer ring is not allocated.\n"));
-        EpDesc = (USB_ENDPOINT_DESCRIPTOR *)((UINTN)EpDesc + EpDesc->Length);
-        continue;
+        if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
+          EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
+          Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
+          CreateTransferRing (Xhc, TR_RING_TRB_NUMBER, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]);
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Created ISO ring [%p~%p) with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        } else {
+          EndpointTransferRing = (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1];
+          XhcReinitializeTransferRing (Xhc, EndpointTransferRing);
+
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Reuse existing ring [%p~%p) for ISO EP with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        }
+
+        break;
       case USB_ENDPOINT_INTERRUPT:
         if (Direction == EfiUsbDataIn) {
           InputContext->EP[Dci-1].CErr   = 3;
@@ -3192,12 +3657,32 @@ XhcInitializeEndpointContext64 (
 
         InputContext->EP[Dci-1].Interval = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
 
-        //
-        // Do not support isochronous transfer now.
-        //
-        DEBUG ((DEBUG_INFO, "XhcInitializeEndpointContext64: Unsupport ISO EP found, Transfer ring is not allocated.\n"));
-        EpDesc = (USB_ENDPOINT_DESCRIPTOR *)((UINTN)EpDesc + EpDesc->Length);
-        continue;
+        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+
+        if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
+          EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
+          Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
+          CreateTransferRing (Xhc, TR_RING_TRB_NUMBER, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]);
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Created ISO ring [%p~%p)\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE)
+            ));
+        } else {
+          EndpointTransferRing = (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1];
+          XhcReinitializeTransferRing (Xhc, EndpointTransferRing);
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Reused ring [%p~%p)\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE)
+            ));
+        }
+
+        break;
       case USB_ENDPOINT_INTERRUPT:
         if (Direction == EfiUsbDataIn) {
           InputContext->EP[Dci-1].CErr   = 3;
@@ -3762,6 +4247,7 @@ XhcSetInterface (
       // 2) Free Transfer Rings of all endpoints that will be affected by the Alternate Interface setting.
       //
       if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1] != NULL) {
+        XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1]);
         RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1])->RingSeg0;
         if (RingSeg != NULL) {
           UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -3969,6 +4455,7 @@ XhcSetInterface64 (
       // 2) Free Transfer Rings of all endpoints that will be affected by the Alternate Interface setting.
       //
       if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1] != NULL) {
+        XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1]);
         RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1])->RingSeg0;
         if (RingSeg != NULL) {
           UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);

@@ -20,6 +20,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define XHC_INT_TRANSFER_SYNC        0x04
 #define XHC_INT_TRANSFER_ASYNC       0x08
 #define XHC_INT_ONLY_TRANSFER_ASYNC  0x10
+#define XHC_ISO_TRANSFER_SYNC        0x20
+#define XHC_ISO_TRANSFER_ASYNC       0x40
 
 //
 // 6.4.6 TRB Types
@@ -74,6 +76,9 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define TRB_COMPLETION_TRB_ERROR               5
 #define TRB_COMPLETION_STALL_ERROR             6
 #define TRB_COMPLETION_SHORT_PACKET            13
+#define TRB_COMPLETION_RING_UNDERRUN           14
+#define TRB_COMPLETION_RING_OVERRUN            15
+#define TRB_COMPLETION_MISSED_SERVICE_ERROR    23
 #define TRB_COMPLETION_STOPPED                 26
 #define TRB_COMPLETION_STOPPED_LENGTH_INVALID  27
 
@@ -162,6 +167,21 @@ typedef struct _EVENT_RING {
 } EVENT_RING;
 
 //
+// A multi-TRB async isochronous submit produced by a single user call to
+// UsbAsyncIsochronousTransfer is split into N driver URBs (one per
+// MaxPacket-sized TD). URB_BURST groups them so that the user-visible
+// callback fires exactly once, after every URB in the group has finished.
+//
+typedef struct _URB_BURST {
+  UINT32                             TotalUrbs;
+  UINT32                             RemainingUrbs;
+  UINTN                              AggregatedCompleted;
+  UINT32                             AggregatedResult;
+  EFI_ASYNC_USB_TRANSFER_CALLBACK    UserCallback;
+  VOID                               *UserContext;
+} URB_BURST;
+
+//
 // URB (Usb Request Block) contains information for all kinds of
 // usb requests.
 //
@@ -179,6 +199,10 @@ typedef struct _URB {
   VOID                               *DataMap;
   EFI_ASYNC_USB_TRANSFER_CALLBACK    Callback;
   VOID                               *Context;
+  //
+  // Isochronous TRB Frame ID
+  //
+  INT32                              FrameId;
   //
   // Execute result
   //
@@ -319,6 +343,35 @@ typedef struct _TRANSFER_TRB_CONTROL_STATUS {
 } TRANSFER_TRB_CONTROL_STATUS;
 
 //
+// 6.4.1.3 Isochronous TRB
+// An Isoch TRB defines isochronous data transfers. Refer to section 3.2.11 for
+// more information on Isoch TRBs and the operation of isochronous endpoints.
+//
+typedef struct _TRANSFER_TRB_ISOCH {
+  UINT32    TRBPtrLo;
+
+  UINT32    TRBPtrHi;
+
+  UINT32    Length    : 17;
+  UINT32    TDSize    : 5;
+  UINT32    IntTarget : 10;
+
+  UINT32    CycleBit  : 1;
+  UINT32    ENT       : 1;
+  UINT32    ISP       : 1;
+  UINT32    NS        : 1;
+  UINT32    CH        : 1;
+  UINT32    IOC       : 1;
+  UINT32    IDT       : 1;
+  UINT32    TBC       : 2;
+  UINT32    BEI       : 1;
+  UINT32    Type      : 6;
+  UINT32    TLBPC     : 4;
+  UINT32    FrameId   : 11;
+  UINT32    SIA       : 1;
+} TRANSFER_TRB_ISOCH;
+
+//
 // 6.4.2.1 Transfer Event TRB
 // A Transfer Event provides the completion status associated with a Transfer TRB. Refer to section 4.11.3.1
 // for more information on the use and operation of Transfer Events.
@@ -367,6 +420,7 @@ typedef union _TRB {
   TRANSFER_TRB_CONTROL_SETUP     TrbCtrSetup;
   TRANSFER_TRB_CONTROL_DATA      TrbCtrData;
   TRANSFER_TRB_CONTROL_STATUS    TrbCtrStatus;
+  TRANSFER_TRB_ISOCH             TrbIsoch;
 } TRB;
 
 //
@@ -819,8 +873,8 @@ XhcExecTransfer (
   );
 
 /**
-  Delete a single asynchronous interrupt transfer for
-  the device and endpoint.
+  Delete a single asynchronous interrupt or isochronous
+  transfer for the device and endpoint.
 
   @param  Xhc                   The XHCI Instance.
   @param  BusAddr               The logical device address assigned by UsbBus driver.
@@ -831,25 +885,25 @@ XhcExecTransfer (
 
 **/
 EFI_STATUS
-XhciDelAsyncIntTransfer (
+XhciDelAsyncTransfer (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  UINT8              BusAddr,
   IN  UINT8              EpNum
   );
 
 /**
-  Remove all the asynchronous interrupt transfers.
+  Remove all the asynchronous interrupt and isochronous transfers.
 
   @param  Xhc                   The XHCI Instance.
 
 **/
 VOID
-XhciDelAllAsyncIntTransfers (
+XhciDelAllAsyncTransfers (
   IN USB_XHCI_INSTANCE  *Xhc
   );
 
 /**
-  Insert a single asynchronous interrupt transfer for
+  Insert a single asynchronous interrupt or isochronous transfer for
   the device and endpoint.
 
   @param Xhc            The XHCI Instance
@@ -857,7 +911,9 @@ XhciDelAllAsyncIntTransfers (
   @param EpAddr         Endpoint addrress
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
+  @param Type           The type of the transfer
   @param DataLen        The length of data buffer
+  @param FrameId        The frame id for isochronous transfer
   @param Callback       The function to call when data is transferred
   @param Context        The context to the callback
 
@@ -865,15 +921,38 @@ XhciDelAllAsyncIntTransfers (
 
 **/
 URB *
-XhciInsertAsyncIntTransfer (
+XhciInsertAsyncTransfer (
   IN USB_XHCI_INSTANCE                *Xhc,
   IN UINT8                            BusAddr,
   IN UINT8                            EpAddr,
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN VOID                             *Data,
   IN UINTN                            DataLen,
+  IN INT32                            FrameId,
   IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
   IN VOID                             *Context
+  );
+
+/**
+  Per-URB callback installed on every member of a multi-TRB async isoch
+  burst. Aggregates this URB's completion into the shared URB_BURST state
+  reached via Context, and forwards a single user-visible callback once the
+  final member URB has reported.
+
+  @param  Data         Unused (always NULL for isoch URBs).
+  @param  DataLength   Number of bytes this URB transferred.
+  @param  Context      Pointer to the shared URB_BURST for this submit.
+  @param  Status       This URB's USB result bitmask.
+**/
+EFI_STATUS
+EFIAPI
+XhciBurstWrapperCallback (
+  IN VOID    *Data,
+  IN UINTN   DataLength,
+  IN VOID    *Context,
+  IN UINT32  Status
   );
 
 /**
@@ -1444,6 +1523,41 @@ XhcCreateUrb (
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
   IN UINTN                            Type,
+  IN EFI_USB_DEVICE_REQUEST           *Request,
+  IN VOID                             *Data,
+  IN UINTN                            DataLen,
+  IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
+  IN VOID                             *Context
+  );
+
+/**
+  Create a new URB for a new isochronous transaction.
+
+  @param  Xhc       The XHCI Instance
+  @param  BusAddr   The logical device address assigned by UsbBus driver
+  @param  EpAddr    Endpoint addrress
+  @param  DevSpeed  The device speed
+  @param  MaxPacket The max packet length of the endpoint
+  @param  Type      The transaction type
+  @param  FrameId   The Frame Id the URB should be scheduled with for isochronous transfer
+  @param  Request   The standard USB request for control transfer
+  @param  Data      The user data to transfer
+  @param  DataLen   The length of data buffer
+  @param  Callback  The function to call when data is transferred
+  @param  Context   The context to the callback
+
+  @return Created URB or NULL
+
+**/
+URB *
+XhcCreateIsochUrb (
+  IN USB_XHCI_INSTANCE                *Xhc,
+  IN UINT8                            BusAddr,
+  IN UINT8                            EpAddr,
+  IN UINT8                            DevSpeed,
+  IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN INT32                            FrameId,
   IN EFI_USB_DEVICE_REQUEST           *Request,
   IN VOID                             *Data,
   IN UINTN                            DataLen,
