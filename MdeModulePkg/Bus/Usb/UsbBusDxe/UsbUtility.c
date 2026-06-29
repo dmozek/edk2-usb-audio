@@ -373,6 +373,111 @@ UsbHcSyncInterruptTransfer (
 }
 
 /**
+  Execute a synchronous isochronous transfer to the target endpoint.
+
+  @param  UsbBus           The USB bus driver.
+  @param  DevAddr          The target device address.
+  @param  EpAddr           The target endpoint address, with direction encoded in
+                           bit 7.
+  @param  DevSpeed         The device's speed.
+  @param  MaxPacket        The endpoint's max packet size.
+  @param  BufferNum        The number of data buffers.
+  @param  Data             Array of pointers to data buffers.
+  @param  DataLength       The length of data buffer.
+  @param  Translator       The transaction translator for low/full speed device.
+  @param  UsbResult        The result of USB execution.
+
+  @retval EFI_SUCCESS      The isochronous transfer is OK.
+  @retval Others           Failed to execute the synchronous isochronous transfer.
+
+**/
+EFI_STATUS
+UsbHcIsochronousTransfer (
+  IN  USB_BUS                             *UsbBus,
+  IN  UINT8                               DevAddr,
+  IN  UINT8                               EpAddr,
+  IN  UINT8                               DevSpeed,
+  IN  UINTN                               MaxPacket,
+  IN  UINT8                               BufferNum,
+  IN OUT VOID                             *Data[],
+  IN  UINTN                               DataLength,
+  IN  EFI_USB2_HC_TRANSACTION_TRANSLATOR  *Translator,
+  OUT UINT32                              *UsbResult
+  )
+{
+  EFI_STATUS  Status;
+
+  Status = UsbBus->Usb2Hc->IsochronousTransfer (
+                             UsbBus->Usb2Hc,
+                             DevAddr,
+                             EpAddr,
+                             DevSpeed,
+                             MaxPacket,
+                             BufferNum,
+                             Data,
+                             DataLength,
+                             Translator,
+                             UsbResult
+                             );
+
+  return Status;
+}
+
+/**
+  Execute an asynchronous isochronous transfer to the target endpoint.
+
+  @param  UsbBus               The USB bus driver.
+  @param  DevAddr              The target device address.
+  @param  EpAddr               The target endpoint address, with direction encoded in
+                               bit 7.
+  @param  DevSpeed             The device's speed.
+  @param  MaxPacket            The endpoint's max packet size.
+  @param  BufferNum            The number of data buffers.
+  @param  Data                 Array of pointers to data buffers.
+  @param  DataLength           The length of data buffer.
+  @param  Translator           The transaction translator for low/full speed device.
+  @param  IsochronousCallBack  The callback routine.
+  @param  Context              Context passed to the callback.
+
+  @retval EFI_SUCCESS          The asynchronous isochronous transfer is submitted or canceled.
+  @retval Others               Failed to execute the asynchronous isochronous transfer.
+
+**/
+EFI_STATUS
+UsbHcAsyncIsochronousTransfer (
+  IN  USB_BUS                             *UsbBus,
+  IN  UINT8                               DevAddr,
+  IN  UINT8                               EpAddr,
+  IN  UINT8                               DevSpeed,
+  IN  UINTN                               MaxPacket,
+  IN  UINT8                               BufferNum,
+  IN OUT VOID                             *Data[],
+  IN  UINTN                               DataLength,
+  IN  EFI_USB2_HC_TRANSACTION_TRANSLATOR  *Translator,
+  IN  EFI_ASYNC_USB_TRANSFER_CALLBACK     IsochronousCallBack,
+  IN  VOID                                *Context OPTIONAL
+  )
+{
+  EFI_STATUS  Status;
+
+  Status = UsbBus->Usb2Hc->AsyncIsochronousTransfer (
+                             UsbBus->Usb2Hc,
+                             DevAddr,
+                             EpAddr,
+                             DevSpeed,
+                             MaxPacket,
+                             BufferNum,
+                             Data,
+                             DataLength,
+                             Translator,
+                             IsochronousCallBack,
+                             Context
+                             );
+
+  return Status;
+}
+
+/**
   Open the USB host controller protocol BY_CHILD.
 
   @param  Bus              The USB bus driver.
