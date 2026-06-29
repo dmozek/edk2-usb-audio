@@ -466,6 +466,25 @@ ON_EXIT:
 }
 
 /**
+  Returns the maximum frame size for an isochronous transfer based on the USB speed.
+
+  @param  UsbSpeed               The speed of the USB device.
+  @return                        The maximum frame size for the given USB speed.
+ **/
+STATIC
+UINTN
+GetIsochFrameSize (
+  IN UINT8  UsbSpeed
+  )
+{
+  if ((UsbSpeed == EFI_USB_SPEED_HIGH) || (UsbSpeed == EFI_USB_SPEED_SUPER)) {
+    return 1024;
+  } else {
+    return 1023;
+  }
+}
+
+/**
   Execute a synchronous isochronous transfer.
 
   @param  This                   The USB IO instance.
@@ -474,7 +493,12 @@ ON_EXIT:
   @param  DataLength             The length of the data to transfer.
   @param  UsbStatus              The result of USB transfer.
 
-  @retval EFI_UNSUPPORTED        Currently isochronous transfer isn't supported.
+  @retval EFI_SUCCESS             The isochronous transfer has been successfully executed.
+  @retval EFI_INVALID_PARAMETER   The parameter DeviceEndpoint is not valid.
+  @retval EFI_OUT_OF_RESOURCES    The request could not be submitted due to a lack of resources.
+  @retval EFI_TIMEOUT             The isochronous transfer cannot be completed within the 1 USB frame time.
+  @retval EFI_DEVICE_ERROR        The transfer failed due to the reason other than timeout, The error status is
+                                  returned in UsbStatus.
 
 **/
 EFI_STATUS
@@ -484,10 +508,71 @@ UsbIoIsochronousTransfer (
   IN  UINT8                DeviceEndpoint,
   IN  OUT VOID             *Data,
   IN  UINTN                DataLength,
-  OUT UINT32               *Status
+  OUT UINT32               *UsbStatus
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_DEVICE         *Dev;
+  USB_INTERFACE      *UsbIf;
+  USB_ENDPOINT_DESC  *EpDesc;
+  EFI_TPL            OldTpl;
+  EFI_STATUS         Status;
+  INTN               FrameSize;
+  UINTN              BytesWritten;
+  UINTN              BytesToWrite;
+  UINT8              BufNum;
+  VOID               *DataArray[1];
+
+  if ((USB_ENDPOINT_ADDR (DeviceEndpoint) == 0) || (USB_ENDPOINT_ADDR (DeviceEndpoint) > 15) ||
+      (UsbStatus == NULL))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_BUS_TPL);
+
+  UsbIf = USB_INTERFACE_FROM_USBIO (This);
+  Dev   = UsbIf->Device;
+
+  EpDesc = UsbGetEndpointDesc (UsbIf, DeviceEndpoint);
+
+  if ((EpDesc == NULL) || (USB_ENDPOINT_TYPE (&EpDesc->Desc) != USB_ENDPOINT_ISO)) {
+    Status = EFI_INVALID_PARAMETER;
+    goto ON_EXIT;
+  }
+
+  FrameSize = GetIsochFrameSize (Dev->Speed);
+
+  if ((EpDesc->Desc.MaxPacketSize < FrameSize) && (EpDesc->Desc.MaxPacketSize != 0)) {
+    FrameSize = EpDesc->Desc.MaxPacketSize & USB_MAX_PACKET_PAYLOAD_SIZE;
+  }
+
+  BufNum = 1;
+
+  for (BytesWritten = 0; BytesWritten < DataLength; BytesWritten += FrameSize) {
+    DataArray[0] = (UINT8 *)Data + BytesWritten;
+    BytesToWrite = MIN (FrameSize, DataLength - BytesWritten);
+
+    Status = UsbHcIsochronousTransfer (
+               Dev->Bus,
+               Dev->Address,
+               DeviceEndpoint,
+               Dev->Speed,
+               FrameSize,
+               BufNum,
+               DataArray,
+               BytesToWrite,
+               &Dev->Translator,
+               UsbStatus
+               );
+
+    if (EFI_ERROR (Status) || (*UsbStatus != EFI_USB_NOERROR)) {
+      goto ON_EXIT;
+    }
+  }
+
+ON_EXIT:
+  gBS->RestoreTPL (OldTpl);
+  return Status;
 }
 
 /**
@@ -501,7 +586,10 @@ UsbIoIsochronousTransfer (
                                  ready.
   @param  Context                The context to the callback.
 
-  @retval EFI_UNSUPPORTED        Currently isochronous transfer isn't supported.
+  @retval EFI_SUCCESS            The asynchronous isochronous transfer request has been successfully
+                                 submitted.
+  @retval EFI_INVALID_PARAMETER  Parameter DeviceEndpoint is not valid.
+  @retval EFI_OUT_OF_RESOURCES   The request could not be submitted due to a lack of resources.
 
 **/
 EFI_STATUS
@@ -515,7 +603,50 @@ UsbIoAsyncIsochronousTransfer (
   IN VOID                             *Context              OPTIONAL
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_DEVICE         *Dev;
+  USB_INTERFACE      *UsbIf;
+  USB_ENDPOINT_DESC  *EpDesc;
+  EFI_TPL            OldTpl;
+  EFI_STATUS         Status;
+  UINT8              BufNum;
+  VOID               *DataArray[1];
+
+  if ((USB_ENDPOINT_ADDR (DeviceEndpoint) == 0) || (USB_ENDPOINT_ADDR (DeviceEndpoint) > 15)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_BUS_TPL);
+
+  UsbIf = USB_INTERFACE_FROM_USBIO (This);
+  Dev   = UsbIf->Device;
+
+  EpDesc = UsbGetEndpointDesc (UsbIf, DeviceEndpoint);
+
+  if ((EpDesc == NULL) || (USB_ENDPOINT_TYPE (&EpDesc->Desc) != USB_ENDPOINT_ISO)) {
+    Status = EFI_INVALID_PARAMETER;
+    goto ON_EXIT;
+  }
+
+  BufNum       = 1;
+  DataArray[0] = Data;
+
+  Status = UsbHcAsyncIsochronousTransfer (
+             Dev->Bus,
+             Dev->Address,
+             DeviceEndpoint,
+             Dev->Speed,
+             EpDesc->Desc.MaxPacketSize & 0x7ff,
+             BufNum,
+             DataArray,
+             DataLength,
+             &Dev->Translator,
+             IsochronousCallBack,
+             Context
+             );
+
+ON_EXIT:
+  gBS->RestoreTPL (OldTpl);
+  return Status;
 }
 
 /**
