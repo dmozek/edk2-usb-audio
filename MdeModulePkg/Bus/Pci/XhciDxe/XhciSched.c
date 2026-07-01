@@ -175,6 +175,7 @@ XhcCreateUrb (
   Urb->DataLen  = DataLen;
   Urb->Callback = Callback;
   Urb->Context  = Context;
+  Urb->FrameId  = -1;
 
   Status = XhcCreateTransferTrb (Xhc, Urb);
   if (EFI_ERROR (Status)) {
@@ -237,6 +238,9 @@ XhcCreateTransferTrb (
   UINTN                          TotalLen;
   UINTN                          Len;
   UINTN                          TrbNum;
+  UINTN                          TdPacketCount;
+  UINTN                          IsochBurstResiduePackets;
+  UINTN                          IsochMaxBurstSize;
   EFI_PCI_IO_PROTOCOL_OPERATION  MapOp;
   EFI_PHYSICAL_ADDRESS           PhyAddr;
   VOID                           *Map;
@@ -448,6 +452,84 @@ XhcCreateTransferTrb (
         TrbStart->TrbNormal.TDSize    = 0;
         TrbStart->TrbNormal.IntTarget = 0;
         TrbStart->TrbNormal.ISP       = 1;
+        TrbStart->TrbNormal.IOC       = 1;
+        TrbStart->TrbNormal.Type      = TRB_TYPE_NORMAL;
+        //
+        // Update the cycle bit
+        //
+        TrbStart->TrbNormal.CycleBit = EPRing->RingPCS & BIT0;
+
+        XhcSyncTrsRing (Xhc, EPRing);
+        TrbNum++;
+        TotalLen += Len;
+      }
+
+      Urb->TrbNum = TrbNum;
+      Urb->TrbEnd = (TRB_TEMPLATE *)(UINTN)TrbStart;
+      break;
+
+    case ED_ISOCH_IN:
+    case ED_ISOCH_OUT:
+      TotalLen = 0;
+      Len      = 0;
+      TrbNum   = 0;
+      TrbStart = (TRB *)(UINTN)EPRing->RingEnqueue;
+
+      IsochMaxBurstSize = (Urb->Ep.MaxPacket & 0x1800) >> 11;
+
+      //
+      // Create Isoch TRB
+      //
+
+      TdPacketCount = (Urb->DataLen + Urb->Ep.MaxPacket - 1) / Urb->Ep.MaxPacket;
+
+      Len = MIN (Urb->DataLen, 0x10000);
+
+      IsochBurstResiduePackets = TdPacketCount % (IsochMaxBurstSize + 1);
+
+      TrbStart                     = (TRB *)(UINTN)EPRing->RingEnqueue;
+      TrbStart->TrbIsoch.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy);
+      TrbStart->TrbIsoch.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy);
+      TrbStart->TrbIsoch.Length    = (UINT32)Len;
+      TrbStart->TrbIsoch.TDSize    = 0;
+      TrbStart->TrbIsoch.IntTarget = 0;
+      TrbStart->TrbIsoch.ISP       = 1;
+      TrbStart->TrbIsoch.IOC       = 1;
+      TrbStart->TrbIsoch.CH        = (Urb->DataLen > Len) ? 1 : 0;
+      TrbStart->TrbIsoch.TBC       = ((TdPacketCount + (IsochMaxBurstSize)) / (IsochMaxBurstSize + 1)) - 1;
+      TrbStart->TrbIsoch.BEI       = 0;
+      TrbStart->TrbIsoch.Type      = TRB_TYPE_ISOCH;
+      TrbStart->TrbIsoch.TLBPC     =  IsochBurstResiduePackets == 0 ? IsochMaxBurstSize : IsochBurstResiduePackets - 1;
+      TrbStart->TrbIsoch.FrameId   = (Urb->ScheduleAsap || (Urb->FrameId < 0)) ? 0 : (UINT16)(Urb->FrameId >> 3);
+      TrbStart->TrbIsoch.SIA       = (Urb->ScheduleAsap || (Urb->FrameId < 0)) ? 1 : 0;
+      TrbStart->TrbIsoch.IDT       = 0;
+      //
+      // Update the cycle bit
+      //
+      TrbStart->TrbIsoch.CycleBit = EPRing->RingPCS & BIT0;
+
+      XhcSyncTrsRing (Xhc, EPRing);
+      TrbNum++;
+      TotalLen += Len;
+
+      //
+      // If Data > 64K, chain normal TRBs
+      //
+      while (TotalLen < Urb->DataLen) {
+        if ((TotalLen + 0x10000) >= Urb->DataLen) {
+          Len = Urb->DataLen - TotalLen;
+        } else {
+          Len = 0x10000;
+        }
+
+        TrbStart                      = (TRB *)(UINTN)EPRing->RingEnqueue;
+        TrbStart->TrbNormal.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+        TrbStart->TrbNormal.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+        TrbStart->TrbNormal.Length    = (UINT32)Len;
+        TrbStart->TrbNormal.TDSize    = 0;
+        TrbStart->TrbNormal.IntTarget = 0;
+        TrbStart->TrbNormal.ISP       = 1;
+        TrbStart->TrbNormal.CH        = ((TotalLen + Len) < Urb->DataLen) ? 1 : 0;
         TrbStart->TrbNormal.IOC       = 1;
         TrbStart->TrbNormal.Type      = TRB_TYPE_NORMAL;
         //
