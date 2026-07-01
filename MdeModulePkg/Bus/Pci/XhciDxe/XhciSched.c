@@ -1220,6 +1220,63 @@ IsAsyncTrb (
 }
 
 /**
+  Per-URB callback installed on every member of a multi-TRB async isoch
+  burst. Aggregates this URB's completion into the shared URB_BURST state
+  reached via Context, and forwards a single user-visible callback once the
+  final member URB has reported.
+
+  @param  Data         Unused (always NULL for isoch URBs).
+  @param  DataLength   Number of bytes this URB transferred.
+  @param  Context      Pointer to the shared URB_BURST for this submit.
+  @param  Status       This URB's USB result bitmask.
+
+  @retval EFI_SUCCESS            The completion was aggregated into the burst.
+  @retval EFI_INVALID_PARAMETER  Context is NULL.
+**/
+EFI_STATUS
+EFIAPI
+XhciBurstWrapperCallback (
+  IN VOID    *Data,
+  IN UINTN   DataLength,
+  IN VOID    *Context,
+  IN UINT32  Status
+  )
+{
+  URB_BURST                        *Burst;
+  EFI_ASYNC_USB_TRANSFER_CALLBACK  UserCallback;
+  VOID                             *UserContext;
+  UINTN                            BurstCompleted;
+  UINT32                           BurstResult;
+
+  Burst = (URB_BURST *)Context;
+  if (Burst == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Burst->AggregatedCompleted += DataLength;
+  Burst->AggregatedResult    |= Status;
+  ASSERT (Burst->RemainingUrbs > 0);
+  Burst->RemainingUrbs--;
+
+  if (Burst->RemainingUrbs != 0) {
+    return EFI_SUCCESS;
+  }
+
+  UserCallback   = Burst->UserCallback;
+  UserContext    = Burst->UserContext;
+  BurstCompleted = Burst->AggregatedCompleted;
+  BurstResult    = Burst->AggregatedResult;
+
+  FreePool (Burst);
+
+  if (UserCallback != NULL) {
+    UserCallback (NULL, BurstCompleted, UserContext, BurstResult);
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
   Reinitialize an already-allocated transfer ring without releasing its
   memory.
 
