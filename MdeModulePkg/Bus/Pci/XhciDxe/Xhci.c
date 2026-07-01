@@ -1470,7 +1470,11 @@ XhcAsyncInterruptTransfer (
           EndPointAddress,
           DeviceSpeed,
           MaximumPacketLength,
+          XHC_INT_TRANSFER_ASYNC,
+          NULL,
           DataLength,
+          0,
+          FALSE,
           CallBackFunction,
           Context
           );

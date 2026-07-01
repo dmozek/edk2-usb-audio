@@ -23,6 +23,7 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define XHC_INT_TRANSFER_ASYNC       0x08
 #define XHC_INT_ONLY_TRANSFER_ASYNC  0x10
 #define XHC_ISO_TRANSFER_SYNC        0x20
+#define XHC_ISO_TRANSFER_ASYNC       0x40
 
 //
 // 6.4.6 TRB Types
@@ -921,7 +922,13 @@ XhciDelAllAsyncTransfers (
   @param EpAddr         Endpoint address
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
+  @param Type           The type of the transfer
+  @param Data           The user data to transfer for isochronous transfers
   @param DataLen        The length of data buffer
+  @param FrameId        The scheduling position in microframes for isochronous transfer
+  @param StartIsochAsap TRUE to execute the isoch TD at the next service opportunity
+                        of the running data flow (Start Isoch ASAP), FALSE to start a
+                        new data flow at FrameId. Ignored for interrupt transfers.
   @param Callback       The function to call when data is transferred
   @param Context        The context to the callback
 
@@ -935,7 +942,11 @@ XhciInsertAsyncTransfer (
   IN UINT8                            EpAddr,
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN VOID                             *Data,
   IN UINTN                            DataLen,
+  IN INT32                            FrameId,
+  IN BOOLEAN                          StartIsochAsap,
   IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
   IN VOID                             *Context
   );
@@ -1531,6 +1542,45 @@ XhcCreateUrb (
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
   IN UINTN                            Type,
+  IN EFI_USB_DEVICE_REQUEST           *Request,
+  IN VOID                             *Data,
+  IN UINTN                            DataLen,
+  IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
+  IN VOID                             *Context
+  );
+
+/**
+  Create a new URB for a new isochronous transaction.
+
+  @param  Xhc       The XHCI Instance
+  @param  BusAddr   The logical device address assigned by UsbBus driver
+  @param  EpAddr    Endpoint address
+  @param  DevSpeed  The device speed
+  @param  MaxPacket The max packet length of the endpoint
+  @param  Type      The transaction type
+  @param  FrameId   The scheduling position of the URB in microframes
+  @param  StartIsochAsap       TRUE to execute the TD at the next service opportunity of the
+                    running data flow (Start Isoch ASAP), FALSE to start a new data
+                    flow at FrameId
+  @param  Request   The standard USB request for control transfer
+  @param  Data      The user data to transfer
+  @param  DataLen   The length of data buffer
+  @param  Callback  The function to call when data is transferred
+  @param  Context   The context to the callback
+
+  @return Created URB or NULL
+
+**/
+URB *
+XhcCreateIsochUrb (
+  IN USB_XHCI_INSTANCE                *Xhc,
+  IN UINT8                            BusAddr,
+  IN UINT8                            EpAddr,
+  IN UINT8                            DevSpeed,
+  IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN INT32                            FrameId,
+  IN BOOLEAN                          StartIsochAsap,
   IN EFI_USB_DEVICE_REQUEST           *Request,
   IN VOID                             *Data,
   IN UINTN                            DataLen,

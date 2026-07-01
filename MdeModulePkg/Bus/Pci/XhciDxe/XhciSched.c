@@ -188,6 +188,83 @@ XhcCreateUrb (
 }
 
 /**
+  Create a new URB for a new isochronous transaction.
+
+  @param  Xhc       The XHCI Instance
+  @param  BusAddr   The logical device address assigned by UsbBus driver
+  @param  EpAddr    Endpoint address
+  @param  DevSpeed  The device speed
+  @param  MaxPacket The max packet length of the endpoint
+  @param  Type      The transaction type
+  @param  FrameId   The scheduling position of the URB in microframes
+  @param  StartIsochAsap       TRUE to execute the TD at the next service opportunity of the
+                    running data flow (Start Isoch ASAP), FALSE to start a new data
+                    flow at FrameId
+  @param  Request   The standard USB request for control transfer
+  @param  Data      The user data to transfer
+  @param  DataLen   The length of data buffer
+  @param  Callback  The function to call when data is transferred
+  @param  Context   The context to the callback
+
+  @return Created URB or NULL
+
+**/
+URB *
+XhcCreateIsochUrb (
+  IN USB_XHCI_INSTANCE                *Xhc,
+  IN UINT8                            BusAddr,
+  IN UINT8                            EpAddr,
+  IN UINT8                            DevSpeed,
+  IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN INT32                            FrameId,
+  IN BOOLEAN                          StartIsochAsap,
+  IN EFI_USB_DEVICE_REQUEST           *Request,
+  IN VOID                             *Data,
+  IN UINTN                            DataLen,
+  IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
+  IN VOID                             *Context
+  )
+{
+  USB_ENDPOINT  *Ep;
+  EFI_STATUS    Status;
+  URB           *Urb;
+
+  Urb = AllocateZeroPool (sizeof (URB));
+  if (Urb == NULL) {
+    return NULL;
+  }
+
+  Urb->Signature = XHC_URB_SIG;
+  InitializeListHead (&Urb->UrbList);
+
+  Ep            = &Urb->Ep;
+  Ep->BusAddr   = BusAddr;
+  Ep->EpAddr    = (UINT8)(EpAddr & 0x0F);
+  Ep->Direction = ((EpAddr & 0x80) != 0) ? EfiUsbDataIn : EfiUsbDataOut;
+  Ep->DevSpeed  = DevSpeed;
+  Ep->MaxPacket = MaxPacket;
+  Ep->Type      = Type;
+
+  Urb->Request      = Request;
+  Urb->Data         = Data;
+  Urb->DataLen      = DataLen;
+  Urb->Callback     = Callback;
+  Urb->Context      = Context;
+  Urb->FrameId      = FrameId;
+  Urb->ScheduleAsap = StartIsochAsap;
+
+  Status = XhcCreateTransferTrb (Xhc, Urb);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "XhcCreateIsochUrb: XhcCreateTransferTrb Failed, Status = %r\n", Status));
+    FreePool (Urb);
+    Urb = NULL;
+  }
+
+  return Urb;
+}
+
+/**
   Free an allocated URB.
   The `Data` field of the URB is not owned by the URB and is not freed here.
   The caller is which allocates `Data` is responsible for freeing it.
@@ -1277,6 +1354,32 @@ XhciBurstWrapperCallback (
 }
 
 /**
+  Drop one member URB from its burst without firing the user callback. Used
+  when a URB is being torn down outside the normal completion path (e.g.
+  the EP ring is being reset by SetInterface and the user-supplied
+  Context/Callback are no longer valid).
+
+  @param  Burst         The burst from which to abandon a member URB.
+**/
+STATIC
+VOID
+XhciBurstWrapperAbandon (
+  IN URB_BURST  *Burst
+  )
+{
+  if (Burst == NULL) {
+    return;
+  }
+
+  ASSERT (Burst->RemainingUrbs > 0);
+  Burst->RemainingUrbs--;
+
+  if (Burst->RemainingUrbs == 0) {
+    FreePool (Burst);
+  }
+}
+
+/**
   Reinitialize an already-allocated transfer ring without releasing its
   memory.
 
@@ -1641,6 +1744,7 @@ XhciDelAsyncTransfer (
   LIST_ENTRY              *Next;
   URB                     *Urb;
   VOID                    *UrbData;
+  BOOLEAN                 OwnsData;
   EFI_USB_DATA_DIRECTION  Direction;
   EFI_STATUS              Status;
 
@@ -1661,17 +1765,19 @@ XhciDelAsyncTransfer (
       //
       Status = XhcDequeueTrbFromEndpoint (Xhc, Urb);
       if (EFI_ERROR (Status)) {
-        DEBUG ((DEBUG_ERROR, "XhciDelAsyncIntTransfer: XhcDequeueTrbFromEndpoint failed\n"));
+        DEBUG ((DEBUG_ERROR, "%a: XhcDequeueTrbFromEndpoint failed\n", __func__));
       }
 
       RemoveEntryList (&Urb->UrbList);
       //
-      // For `XhciDelAsyncIntTransfer`, the URB is created through `XhciInsertAsyncIntTransfer`
-      // and allocates and manages its own data buffer, so free it here.
+      // Only async-interrupt URBs own their data buffer (allocated by
+      // XhciInsertAsyncTransfer). For async-isochronous URBs the data buffer is
+      // supplied by the caller and must not be freed here.
       //
-      UrbData = Urb->Data;
+      UrbData  = Urb->Data;
+      OwnsData = (BOOLEAN)(Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC);
       XhcFreeUrb (Xhc, Urb);
-      if (UrbData != NULL) {
+      if (OwnsData && (UrbData != NULL)) {
         FreePool (UrbData);
       }
 
@@ -1697,6 +1803,7 @@ XhciDelAllAsyncTransfers (
   LIST_ENTRY  *Next;
   URB         *Urb;
   VOID        *UrbData;
+  BOOLEAN     OwnsData;
   EFI_STATUS  Status;
 
   BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
@@ -1708,17 +1815,24 @@ XhciDelAllAsyncTransfers (
     //
     Status = XhcDequeueTrbFromEndpoint (Xhc, Urb);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "XhciDelAllAsyncTransfers: XhcDequeueTrbFromEndpoint failed\n"));
+      DEBUG ((DEBUG_ERROR, "%a: XhcDequeueTrbFromEndpoint failed\n", __func__));
     }
 
     RemoveEntryList (&Urb->UrbList);
+
+    if (Urb->Callback == XhciBurstWrapperCallback) {
+      XhciBurstWrapperAbandon ((URB_BURST *)Urb->Context);
+    }
+
     //
-    // For `XhciDelAllAsyncIntTransfers`, the URB is created through `XhciInsertAsyncIntTransfer`
-    // and allocates and manages its own data buffer, so free it here.
+    // Only async-interrupt URBs own their data buffer (allocated by
+    // XhciInsertAsyncTransfer). For async-isochronous URBs the data buffer is
+    // supplied by the caller and must not be freed here.
     //
-    UrbData = Urb->Data;
+    UrbData  = Urb->Data;
+    OwnsData = (BOOLEAN)(Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC);
     XhcFreeUrb (Xhc, Urb);
-    if (UrbData != NULL) {
+    if (OwnsData && (UrbData != NULL)) {
       FreePool (UrbData);
     }
   }
@@ -1733,7 +1847,13 @@ XhciDelAllAsyncTransfers (
   @param EpAddr         Endpoint address
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
+  @param Type           The type of the transfer
+  @param Data           The user data to transfer for isochronous transfers
   @param DataLen        The length of data buffer
+  @param FrameId        The scheduling position in microframes for isochronous transfer
+  @param StartIsochAsap TRUE to execute the isoch TD at the next service opportunity
+                        of the running data flow (Start Isoch ASAP), FALSE to start a
+                        new data flow at FrameId. Ignored for interrupt transfers.
   @param Callback       The function to call when data is transferred
   @param Context        The context to the callback
 
@@ -1747,36 +1867,63 @@ XhciInsertAsyncTransfer (
   IN UINT8                            EpAddr,
   IN UINT8                            DevSpeed,
   IN UINTN                            MaxPacket,
+  IN UINTN                            Type,
+  IN VOID                             *Data,
   IN UINTN                            DataLen,
+  IN INT32                            FrameId,
+  IN BOOLEAN                          StartIsochAsap,
   IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
   IN VOID                             *Context
   )
 {
-  VOID  *Data;
-  URB   *Urb;
+  URB  *Urb;
 
-  Data = AllocateZeroPool (DataLen);
-  if (Data == NULL) {
-    DEBUG ((DEBUG_ERROR, "%a: failed to allocate buffer\n", __func__));
-    return NULL;
+  ASSERT (Type == XHC_INT_TRANSFER_ASYNC || Type == XHC_ISO_TRANSFER_ASYNC);
+
+  if (Type == XHC_INT_TRANSFER_ASYNC) {
+    Data = AllocateZeroPool (DataLen);
+    if (Data == NULL) {
+      DEBUG ((DEBUG_ERROR, "%a: failed to allocate buffer\n", __func__));
+      return NULL;
+    }
+
+    Urb = XhcCreateUrb (
+            Xhc,
+            BusAddr,
+            EpAddr,
+            DevSpeed,
+            MaxPacket,
+            XHC_INT_TRANSFER_ASYNC,
+            NULL,
+            Data,
+            DataLen,
+            Callback,
+            Context
+            );
+  } else {
+    Urb = XhcCreateIsochUrb (
+            Xhc,
+            BusAddr,
+            EpAddr,
+            DevSpeed,
+            MaxPacket,
+            Type,
+            FrameId,
+            StartIsochAsap,
+            NULL,
+            Data,
+            DataLen,
+            Callback,
+            Context
+            );
   }
 
-  Urb = XhcCreateUrb (
-          Xhc,
-          BusAddr,
-          EpAddr,
-          DevSpeed,
-          MaxPacket,
-          XHC_INT_TRANSFER_ASYNC,
-          NULL,
-          Data,
-          DataLen,
-          Callback,
-          Context
-          );
   if (Urb == NULL) {
     DEBUG ((DEBUG_ERROR, "%a: failed to create URB\n", __func__));
-    FreePool (Data);
+    if (Type == XHC_INT_TRANSFER_ASYNC) {
+      FreePool (Data);
+    }
+
     return NULL;
   }
 
@@ -1899,6 +2046,8 @@ XhcMonitorAsyncRequests (
 
   Xhc = (USB_XHCI_INSTANCE *)Context;
 
+  ProcBuf = NULL;
+
   BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     //
     // Save values passed into the callback.
@@ -1937,29 +2086,31 @@ XhcMonitorAsyncRequests (
     //
     Status = XhcFlushAsyncIntMap (Xhc, Urb);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "XhcMonitorAsyncRequests: Fail to Flush AsyncInt Mapped Memeory\n"));
+      DEBUG ((DEBUG_ERROR, "XhcMonitorAsyncRequests: Fail to Flush AsyncInt Mapped Memory\n"));
     }
 
-    //
-    // Allocate a buffer then copy the transferred data for user.
-    // If failed to allocate the buffer, update the URB for next
-    // round of transfer. Ignore the data of this round.
-    //
-    ProcBuf = NULL;
-    if (Urb->Result == EFI_USB_NOERROR) {
+    if (Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC) {
       //
-      // Make sure the data received from HW is no more than expected.
+      // Allocate a buffer then copy the transferred data for user.
+      // If failed to allocate the buffer, update the URB for next
+      // round of transfer. Ignore the data of this round.
       //
-      if (Urb->Completed <= Urb->DataLen) {
-        ProcBuf = AllocateZeroPool (Urb->Completed);
-      }
+      ProcBuf = NULL;
+      if (Urb->Result == EFI_USB_NOERROR) {
+        //
+        // Make sure the data received from HW is no more than expected.
+        //
+        if (Urb->Completed <= Urb->DataLen) {
+          ProcBuf = AllocateZeroPool (Urb->Completed);
+        }
 
-      if (ProcBuf == NULL) {
-        XhcUpdateAsyncRequest (Xhc, Urb);
-        continue;
-      }
+        if (ProcBuf == NULL) {
+          XhcUpdateAsyncRequest (Xhc, Urb);
+          continue;
+        }
 
-      CopyMem (ProcBuf, Urb->Data, Urb->Completed);
+        CopyMem (ProcBuf, Urb->Data, Urb->Completed);
+      }
     }
 
     //
@@ -1969,11 +2120,13 @@ XhcMonitorAsyncRequests (
     cbResult    = Urb->Result;
     cbContext   = Urb->Context;
 
-    //
-    // The update call must occur before the callback since the callback
-    // may remove and free the URB, leading to a fault.
-    //
-    XhcUpdateAsyncRequest (Xhc, Urb);
+    if (Urb->Ep.Type == XHC_INT_TRANSFER_ASYNC) {
+      //
+      // The update call must occur before the callback since the callback
+      // may remove and free the URB, leading to a fault.
+      //
+      XhcUpdateAsyncRequest (Xhc, Urb);
+    }
 
     //
     // Leave error recovery to its related device driver. A
@@ -1997,6 +2150,16 @@ XhcMonitorAsyncRequests (
 
     if (ProcBuf != NULL) {
       gBS->FreePool (ProcBuf);
+      ProcBuf = NULL;
+    }
+
+    //
+    // Async isochronous URBs are one-shot: after the (last) callback fires,
+    // detach the URB from the list and free it.
+    //
+    if (Urb->Ep.Type == XHC_ISO_TRANSFER_ASYNC) {
+      RemoveEntryList (&Urb->UrbList);
+      XhcFreeUrb (Xhc, Urb);
     }
   }
   gBS->RestoreTPL (OldTpl);
