@@ -166,6 +166,21 @@ typedef struct _EVENT_RING {
 } EVENT_RING;
 
 //
+// A multi-TRB async isochronous submit produced by a single user call to
+// UsbAsyncIsochronousTransfer is split into N driver URBs (one per
+// MaxPacket-sized TD). URB_BURST groups them so that the user-visible
+// callback fires exactly once, after every URB in the group has finished.
+//
+typedef struct _URB_BURST {
+  UINT32                             TotalUrbs;
+  UINT32                             RemainingUrbs;
+  UINTN                              AggregatedCompleted;
+  UINT32                             AggregatedResult;
+  EFI_ASYNC_USB_TRANSFER_CALLBACK    UserCallback;
+  VOID                               *UserContext;
+} URB_BURST;
+
+//
 // URB (Usb Request Block) contains information for all kinds of
 // usb requests.
 //
@@ -916,6 +931,29 @@ XhciInsertAsyncTransfer (
   IN UINTN                            DataLen,
   IN EFI_ASYNC_USB_TRANSFER_CALLBACK  Callback,
   IN VOID                             *Context
+  );
+
+/**
+  Per-URB callback installed on every member of a multi-TRB async isoch
+  burst. Aggregates this URB's completion into the shared URB_BURST state
+  reached via Context, and forwards a single user-visible callback once the
+  final member URB has reported.
+
+  @param  Data         Unused (always NULL for isoch URBs).
+  @param  DataLength   Number of bytes this URB transferred.
+  @param  Context      Pointer to the shared URB_BURST for this submit.
+  @param  Status       This URB's USB result bitmask.
+
+  @retval EFI_SUCCESS            The completion was aggregated into the burst.
+  @retval EFI_INVALID_PARAMETER  Context is NULL.
+**/
+EFI_STATUS
+EFIAPI
+XhciBurstWrapperCallback (
+  IN VOID    *Data,
+  IN UINTN   DataLength,
+  IN VOID    *Context,
+  IN UINT32  Status
   );
 
 /**
