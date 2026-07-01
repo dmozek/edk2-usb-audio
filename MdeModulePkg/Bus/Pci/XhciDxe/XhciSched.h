@@ -20,6 +20,7 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define XHC_INT_TRANSFER_SYNC        0x04
 #define XHC_INT_TRANSFER_ASYNC       0x08
 #define XHC_INT_ONLY_TRANSFER_ASYNC  0x10
+#define XHC_ISO_TRANSFER_SYNC        0x20
 
 //
 // 6.4.6 TRB Types
