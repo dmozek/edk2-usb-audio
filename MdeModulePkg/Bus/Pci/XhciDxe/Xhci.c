@@ -205,10 +205,9 @@ XhcReset (
       }
 
       //
-      // Clean up the asynchronous transfers, currently only
-      // interrupt supports asynchronous operation.
+      // Clean up the asynchronous interrupt and isochronous transfers.
       //
-      XhciDelAllAsyncIntTransfers (Xhc);
+      XhciDelAllAsyncTransfers (Xhc);
       XhcFreeSched (Xhc);
 
       XhcInitSched (Xhc);
@@ -1444,7 +1443,7 @@ XhcAsyncInterruptTransfer (
       goto ON_EXIT;
     }
 
-    Status = XhciDelAsyncIntTransfer (Xhc, DeviceAddress, EndPointAddress);
+    Status = XhciDelAsyncTransfer (Xhc, DeviceAddress, EndPointAddress);
     DEBUG ((DEBUG_INFO, "XhcAsyncInterruptTransfer: remove old transfer for addr %d, Status = %r\n", DeviceAddress, Status));
     goto ON_EXIT;
   }
@@ -1465,7 +1464,7 @@ XhcAsyncInterruptTransfer (
     goto ON_EXIT;
   }
 
-  Urb = XhciInsertAsyncIntTransfer (
+  Urb = XhciInsertAsyncTransfer (
           Xhc,
           DeviceAddress,
           EndPointAddress,
@@ -2038,7 +2037,7 @@ XhcCreateUsbHc (
     Xhc->Usb2Hc.MinorRevision = (ReleaseNumber & 0x0F);
   }
 
-  InitializeListHead (&Xhc->AsyncIntTransfers);
+  InitializeListHead (&Xhc->AsyncTransfers);
 
   //
   // Be caution that the Offset passed to XhcReadCapReg() should be Dword align
@@ -2484,7 +2483,7 @@ XhcDriverBindingStop (
 
   XhcHaltHC (Xhc, XHC_GENERIC_TIMEOUT);
   XhcClearBiosOwnership (Xhc);
-  XhciDelAllAsyncIntTransfers (Xhc);
+  XhciDelAllAsyncTransfers (Xhc);
   XhcFreeSched (Xhc);
 
   if (Xhc->ControllerNameTable) {

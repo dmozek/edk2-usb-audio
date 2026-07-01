@@ -221,7 +221,7 @@ struct _USB_XHCI_INSTANCE {
   //
   EFI_EVENT                   ExitBootServiceEvent;
   EFI_EVENT                   PollTimer;
-  LIST_ENTRY                  AsyncIntTransfers;
+  LIST_ENTRY                  AsyncTransfers;
 
   UINT8                       CapLength;  ///< Capability Register Length
   XHC_HCSPARAMS1              HcSParams1; ///< Structural Parameters 1
