@@ -78,6 +78,11 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define TRB_COMPLETION_STOPPED_LENGTH_INVALID  27
 
 //
+// Max value of TRB Transfer Length for Normal and Iosch TRBs
+//
+#define TRB_MAX_TRANSFER_LENGTH  0x10000
+
+//
 // USB Transfer Results Internal Definition
 // Based on XHCI spec 4.8.3, software should do the reset endpoint while USB Transaction occur.
 // Add the error code for USB Transaction error since UEFI spec don't have the related definition.
@@ -179,6 +184,14 @@ typedef struct _URB {
   VOID                               *DataMap;
   EFI_ASYNC_USB_TRANSFER_CALLBACK    Callback;
   VOID                               *Context;
+  //
+  // Isochronous scheduling position in microframes.
+  //
+  INT32                              FrameId;
+  //
+  // Start Isoch ASAP
+  //
+  BOOLEAN                            ScheduleAsap;
   //
   // Execute result
   //
@@ -319,6 +332,35 @@ typedef struct _TRANSFER_TRB_CONTROL_STATUS {
 } TRANSFER_TRB_CONTROL_STATUS;
 
 //
+// 6.4.1.3 Isochronous TRB
+// An Isoch TRB defines isochronous data transfers. Refer to section 3.2.11 for
+// more information on Isoch TRBs and the operation of isochronous endpoints.
+//
+typedef struct _TRANSFER_TRB_ISOCH {
+  UINT32    TRBPtrLo;
+
+  UINT32    TRBPtrHi;
+
+  UINT32    Length    : 17;
+  UINT32    TDSize    : 5;
+  UINT32    IntTarget : 10;
+
+  UINT32    CycleBit  : 1;
+  UINT32    ENT       : 1;
+  UINT32    ISP       : 1;
+  UINT32    NS        : 1;
+  UINT32    CH        : 1;
+  UINT32    IOC       : 1;
+  UINT32    IDT       : 1;
+  UINT32    TBC       : 2;
+  UINT32    BEI       : 1;
+  UINT32    Type      : 6;
+  UINT32    TLBPC     : 4;
+  UINT32    FrameId   : 11;
+  UINT32    SIA       : 1;
+} TRANSFER_TRB_ISOCH;
+
+//
 // 6.4.2.1 Transfer Event TRB
 // A Transfer Event provides the completion status associated with a Transfer TRB. Refer to section 4.11.3.1
 // for more information on the use and operation of Transfer Events.
@@ -367,6 +409,7 @@ typedef union _TRB {
   TRANSFER_TRB_CONTROL_SETUP     TrbCtrSetup;
   TRANSFER_TRB_CONTROL_DATA      TrbCtrData;
   TRANSFER_TRB_CONTROL_STATUS    TrbCtrStatus;
+  TRANSFER_TRB_ISOCH             TrbIsoch;
 } TRB;
 
 //

@@ -175,6 +175,7 @@ XhcCreateUrb (
   Urb->DataLen  = DataLen;
   Urb->Callback = Callback;
   Urb->Context  = Context;
+  Urb->FrameId  = -1;
 
   Status = XhcCreateTransferTrb (Xhc, Urb);
   if (EFI_ERROR (Status)) {
@@ -211,6 +212,124 @@ XhcFreeUrb (
   }
 
   FreePool (Urb);
+}
+
+/**
+ Create a isoch TRB for a given URB.
+
+  @param  Trb                   The TRB to create.
+  @param  Urb                   The URB to create the TRB for.
+  @param  DataLength            The length of data to transfer in this TRB.
+ **/
+STATIC
+VOID
+XhcCreateIsochTrb (
+  IN OUT TRB    *Trb,
+  IN     URB    *Urb,
+  IN     UINTN  DataLength
+  )
+{
+  UINTN  BurstResiduePackets;
+  UINTN  MaxBurstSize;
+  UINTN  TdPacketCount;
+
+  MaxBurstSize        = (Urb->Ep.MaxPacket & USB_MAX_PACKET_MULT_TRANSACTIONS) >> 11;
+  TdPacketCount       = (Urb->DataLen + Urb->Ep.MaxPacket - 1) / Urb->Ep.MaxPacket;
+  BurstResiduePackets = TdPacketCount % (MaxBurstSize + 1);
+
+  Trb->TrbIsoch.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy);
+  Trb->TrbIsoch.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy);
+  Trb->TrbIsoch.Length    = (UINT32)DataLength;
+  Trb->TrbIsoch.TDSize    = 0;
+  Trb->TrbIsoch.IntTarget = 0;
+  Trb->TrbIsoch.ISP       = 1;
+  Trb->TrbIsoch.IOC       = 1;
+  Trb->TrbIsoch.CH        = (Urb->DataLen > DataLength) ? 1 : 0;
+  Trb->TrbIsoch.TBC       = ((TdPacketCount + (MaxBurstSize)) / (MaxBurstSize + 1)) - 1;
+  Trb->TrbIsoch.BEI       = 0;
+  Trb->TrbIsoch.Type      = TRB_TYPE_ISOCH;
+  Trb->TrbIsoch.TLBPC     =  BurstResiduePackets == 0 ? MaxBurstSize : BurstResiduePackets - 1;
+  Trb->TrbIsoch.FrameId   = (Urb->ScheduleAsap || (Urb->FrameId < 0)) ? 0 : (UINT16)(Urb->FrameId >> 3);
+  Trb->TrbIsoch.SIA       = (Urb->ScheduleAsap || (Urb->FrameId < 0)) ? 1 : 0;
+  Trb->TrbIsoch.IDT       = 0;
+}
+
+/**
+  Create a new isochronous transfer descriptor (TD) for the given URB.
+
+  This creates one isoch TRB followed by zero or more normal TRBs.
+
+  @param  Xhc                   The XHCI Instance
+  @param  EPRing                The endpoint transfer ring
+  @param  Urb                   The URB to create the TD for
+ **/
+STATIC
+VOID
+XhcCreateIsochTd (
+  IN     USB_XHCI_INSTANCE  *Xhc,
+  IN OUT TRANSFER_RING      *EPRing,
+  IN     URB                *Urb
+
+  )
+{
+  UINTN  TotalLen;
+  UINTN  DataLength;
+  UINTN  TrbNum;
+  TRB    *TrbStart;
+
+  TotalLen   = 0;
+  DataLength = 0;
+  TrbNum     = 0;
+  TrbStart   = (TRB *)(UINTN)EPRing->RingEnqueue;
+  DataLength = MIN (Urb->DataLen, TRB_MAX_TRANSFER_LENGTH);
+
+  //
+  // Create Isoch TRB
+  //
+  TrbStart = (TRB *)(UINTN)EPRing->RingEnqueue;
+  XhcCreateIsochTrb (TrbStart, Urb, DataLength);
+
+  //
+  // Update the cycle bit
+  //
+  TrbStart->TrbIsoch.CycleBit = EPRing->RingPCS & BIT0;
+
+  XhcSyncTrsRing (Xhc, EPRing);
+  TrbNum++;
+  TotalLen += DataLength;
+
+  //
+  // If Data > 64K, chain normal TRBs
+  //
+  while (TotalLen < Urb->DataLen) {
+    if ((TotalLen + TRB_MAX_TRANSFER_LENGTH) >= Urb->DataLen) {
+      DataLength = Urb->DataLen - TotalLen;
+    } else {
+      DataLength = TRB_MAX_TRANSFER_LENGTH;
+    }
+
+    TrbStart                      = (TRB *)(UINTN)EPRing->RingEnqueue;
+    TrbStart->TrbNormal.TRBPtrLo  = XHC_LOW_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+    TrbStart->TrbNormal.TRBPtrHi  = XHC_HIGH_32BIT ((UINT8 *)Urb->DataPhy + TotalLen);
+    TrbStart->TrbNormal.Length    = (UINT32)DataLength;
+    TrbStart->TrbNormal.TDSize    = 0;
+    TrbStart->TrbNormal.IntTarget = 0;
+    TrbStart->TrbNormal.ISP       = 1;
+    TrbStart->TrbNormal.CH        = ((TotalLen + DataLength) < Urb->DataLen) ? 1 : 0;
+    TrbStart->TrbNormal.IOC       = 1;
+    TrbStart->TrbNormal.Type      = TRB_TYPE_NORMAL;
+    //
+    // Update the cycle bit
+    //
+    TrbStart->TrbNormal.CycleBit = EPRing->RingPCS & BIT0;
+
+    XhcSyncTrsRing (Xhc, EPRing);
+    TrbNum++;
+    TotalLen += DataLength;
+  }
+
+  Urb->TrbNum = TrbNum;
+  Urb->TrbEnd = (TRB_TEMPLATE *)(UINTN)TrbStart;
 }
 
 /**
@@ -399,10 +518,10 @@ XhcCreateTransferTrb (
       TrbNum   = 0;
       TrbStart = (TRB *)(UINTN)EPRing->RingEnqueue;
       while (TotalLen < Urb->DataLen) {
-        if ((TotalLen + 0x10000) >= Urb->DataLen) {
+        if ((TotalLen + TRB_MAX_TRANSFER_LENGTH) >= Urb->DataLen) {
           Len = Urb->DataLen - TotalLen;
         } else {
-          Len = 0x10000;
+          Len = TRB_MAX_TRANSFER_LENGTH;
         }
 
         TrbStart                      = (TRB *)(UINTN)EPRing->RingEnqueue;
@@ -435,10 +554,10 @@ XhcCreateTransferTrb (
       TrbNum   = 0;
       TrbStart = (TRB *)(UINTN)EPRing->RingEnqueue;
       while (TotalLen < Urb->DataLen) {
-        if ((TotalLen + 0x10000) >= Urb->DataLen) {
+        if ((TotalLen + TRB_MAX_TRANSFER_LENGTH) >= Urb->DataLen) {
           Len = Urb->DataLen - TotalLen;
         } else {
-          Len = 0x10000;
+          Len = TRB_MAX_TRANSFER_LENGTH;
         }
 
         TrbStart                      = (TRB *)(UINTN)EPRing->RingEnqueue;
@@ -462,6 +581,11 @@ XhcCreateTransferTrb (
 
       Urb->TrbNum = TrbNum;
       Urb->TrbEnd = (TRB_TEMPLATE *)(UINTN)TrbStart;
+      break;
+
+    case ED_ISOCH_IN:
+    case ED_ISOCH_OUT:
+      XhcCreateIsochTd (Xhc, EPRing, Urb);
       break;
 
     default:
