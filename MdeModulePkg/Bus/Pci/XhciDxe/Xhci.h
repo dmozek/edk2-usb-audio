@@ -58,6 +58,11 @@ typedef struct _USB_DEV_CONTEXT    USB_DEV_CONTEXT;
 //
 #define XHC_GENERIC_TIMEOUT  (10 * 1000)
 //
+// Minimum timeout for synchronous isochronous transfer polling.
+// The unit is millisecond, setting it as 20ms
+//
+#define XHC_SYNC_ISO_TIMEOUT_FLOOR  (20)
+//
 // XHC reset timeout experience values.
 // The unit is millisecond, setting it as 1s.
 //
