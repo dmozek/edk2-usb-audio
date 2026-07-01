@@ -1284,6 +1284,23 @@ XhcCheckUrbResult (
     }
 
     //
+    // Ring Underrun / Ring Overrun events carry no valid TRB pointer.
+    // Skip them before the URB-matching block.
+    //
+    if ((EvtTrb->Completecode == TRB_COMPLETION_RING_UNDERRUN) ||
+        (EvtTrb->Completecode == TRB_COMPLETION_RING_OVERRUN))
+    {
+      DEBUG ((
+        DEBUG_VERBOSE,
+        "XhcCheckUrbResult: EP-level event code=0x%x SlotId=%d EpId=%d\n",
+        EvtTrb->Completecode,
+        EvtTrb->SlotId,
+        EvtTrb->EndpointId
+        ));
+      continue;
+    }
+
+    //
     // Need convert pci device address to host address
     //
     PhyAddr = (EFI_PHYSICAL_ADDRESS)(EvtTrb->TRBPtrLo | LShiftU64 ((UINT64)EvtTrb->TRBPtrHi, 32));
@@ -1302,6 +1319,10 @@ XhcCheckUrbResult (
     } else if (IsAsyncIntTrb (Xhc, TRBPtr, &AsyncUrb)) {
       CheckedUrb = AsyncUrb;
     } else {
+      continue;
+    }
+
+    if (CheckedUrb->Finished) {
       continue;
     }
 
@@ -1357,6 +1378,13 @@ XhcCheckUrbResult (
           CheckedUrb->Completed += (((TRANSFER_TRB_NORMAL *)TRBPtr)->Length - EvtTrb->Length);
         }
 
+        break;
+
+      //
+      // The xHC skipped this isoch TD to resynchronize the pipe and no data was moved.
+      // Fall through to the start/end TRB bookkeeping so the TD still retires and its event fires.
+      //
+      case TRB_COMPLETION_MISSED_SERVICE_ERROR:
         break;
 
       default:

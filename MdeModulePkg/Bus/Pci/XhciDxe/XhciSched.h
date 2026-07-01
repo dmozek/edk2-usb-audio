@@ -74,6 +74,9 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define TRB_COMPLETION_TRB_ERROR               5
 #define TRB_COMPLETION_STALL_ERROR             6
 #define TRB_COMPLETION_SHORT_PACKET            13
+#define TRB_COMPLETION_RING_UNDERRUN           14
+#define TRB_COMPLETION_RING_OVERRUN            15
+#define TRB_COMPLETION_MISSED_SERVICE_ERROR    23
 #define TRB_COMPLETION_STOPPED                 26
 #define TRB_COMPLETION_STOPPED_LENGTH_INVALID  27
 
