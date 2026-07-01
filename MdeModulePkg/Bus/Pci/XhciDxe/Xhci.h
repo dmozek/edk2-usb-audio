@@ -77,6 +77,20 @@ typedef struct _USB_DEV_CONTEXT    USB_DEV_CONTEXT;
 // The unit is 100us, takes 1ms as interval.
 //
 #define XHC_ASYNC_TIMER_INTERVAL  EFI_TIMER_PERIOD_MILLISECONDS(1)
+//
+// XHC isochronous transfers may not schedule a TD with a Frame ID value greater than MFINDEX + 895ms
+// Since a frame is 1 ms the unit is ms or frames
+//
+#define XHC_END_FRAME_OFFSET  895
+//
+// One frame for isocrhonous transfers is as long as 8 microframes.
+//
+#define XHC_MICROFRAMES_PER_FRAME  8
+//
+// Bit 3 of the Isochronous Scheduling Threshold (IST) field indicates whether the value is in frames or microframes.
+// If the bit is set, the value is in frames.  Otherwise, the value is in microframes.
+//
+#define XHC_IST_IS_IN_MICROFRAMES(IsochronousSchedulingThreshold)  ((IsochronousSchedulingThreshold & BIT3) == 0)
 
 //
 // XHC raises TPL to TPL_NOTIFY to serialize all its operations
