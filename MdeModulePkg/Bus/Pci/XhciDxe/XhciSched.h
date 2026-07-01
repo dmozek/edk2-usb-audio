@@ -12,6 +12,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #define XHC_URB_SIG                   SIGNATURE_32 ('U', 'S', 'B', 'R')
 #define XHC_INIT_DEVICE_SLOT_RETRIES  1
 
+#define XHC_DEFAULT_AVERAGE_TRB_LENGTH  0x1000
+
 //
 // Transfer types, used in URB to identify the transfer type
 //

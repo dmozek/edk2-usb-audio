@@ -1220,6 +1220,42 @@ IsAsyncIntTrb (
 }
 
 /**
+  Reinitialize an already-allocated transfer ring without releasing its
+  memory.
+
+  @param  Xhc   The XHCI instance whose ring to reinit.
+  @param  Ring  The transfer ring to reinit.
+**/
+VOID
+XhcReinitializeTransferRing (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN TRANSFER_RING      *Ring
+  )
+{
+  LINK_TRB              *EndTrb;
+  EFI_PHYSICAL_ADDRESS  PhyAddr;
+
+  ASSERT (Ring != NULL);
+  ASSERT (Ring->RingSeg0 != NULL);
+
+  ZeroMem (Ring->RingSeg0, sizeof (TRB_TEMPLATE) * Ring->TrbNumber);
+  Ring->RingEnqueue = (TRB_TEMPLATE *)Ring->RingSeg0;
+  Ring->RingDequeue = (TRB_TEMPLATE *)Ring->RingSeg0;
+  Ring->RingPCS     = 1;
+
+  //
+  // Reinstall the Link TRB at the tail of the ring (XHCI 4.9.2)
+  //
+  EndTrb           = (LINK_TRB *)((UINTN)Ring->RingSeg0 + sizeof (TRB_TEMPLATE) * (Ring->TrbNumber - 1));
+  EndTrb->Type     = TRB_TYPE_LINK;
+  PhyAddr          = UsbHcGetPciAddrForHostAddr (Xhc->MemPool, Ring->RingSeg0, sizeof (TRB_TEMPLATE) * Ring->TrbNumber, TRUE);
+  EndTrb->PtrLo    = XHC_LOW_32BIT (PhyAddr);
+  EndTrb->PtrHi    = XHC_HIGH_32BIT (PhyAddr);
+  EndTrb->TC       = 1;
+  EndTrb->CycleBit = 0;
+}
+
+/**
   Check the URB's execution result and update the URB's
   result accordingly.
 
@@ -3142,7 +3178,7 @@ XhcInitializeEndpointContext (
           InputContext->EP[Dci-1].EPType = ED_BULK_OUT;
         }
 
-        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
         if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
           EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
           Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
@@ -3166,14 +3202,46 @@ XhcInitializeEndpointContext (
           InputContext->EP[Dci-1].EPType = ED_ISOCH_OUT;
         }
 
-        InputContext->EP[Dci-1].Interval = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].Interval         = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
 
         //
-        // Do not support isochronous transfer now.
+        // Bits 10:0 of wMaxPacketSize hold the packet size.
+        // For high-speed endpoints bits 12:11 additionally hold
+        // the number of additional transaction opportunities per microframe.
         //
-        DEBUG ((DEBUG_INFO, "XhcInitializeEndpointContext: Unsupport ISO EP found, Transfer ring is not allocated.\n"));
-        EpDesc = (USB_ENDPOINT_DESCRIPTOR *)((UINTN)EpDesc + EpDesc->Length);
-        continue;
+        InputContext->EP[Dci-1].MaxPacketSize  = EpDesc->MaxPacketSize & USB_MAX_PACKET_PAYLOAD_SIZE;
+        InputContext->EP[Dci-1].MaxBurstSize   = (EpDesc->MaxPacketSize & USB_MAX_PACKET_MULT_TRANSACTIONS) >> 11;
+        InputContext->EP[Dci-1].MaxESITPayload = InputContext->EP[Dci-1].MaxPacketSize *
+                                                 (InputContext->EP[Dci-1].MaxBurstSize + 1);
+
+        if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
+          EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
+          Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
+          CreateTransferRing (Xhc, TR_RING_TRB_NUMBER, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]);
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Created ISO ring [%p~%p) with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        } else {
+          EndpointTransferRing = (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1];
+          XhcReinitializeTransferRing (Xhc, EndpointTransferRing);
+
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Reuse existing ring [%p~%p) for ISO EP with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        }
+
+        break;
       case USB_ENDPOINT_INTERRUPT:
         if (Direction == EfiUsbDataIn) {
           InputContext->EP[Dci-1].CErr   = 3;
@@ -3183,12 +3251,12 @@ XhcInitializeEndpointContext (
           InputContext->EP[Dci-1].EPType = ED_INTERRUPT_OUT;
         }
 
-        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
         InputContext->EP[Dci-1].MaxESITPayload   = EpDesc->MaxPacketSize;
         InputContext->EP[Dci-1].Interval         = CalculateInterval (USB_ENDPOINT_INTERRUPT, DeviceSpeed, EpDesc->Interval);
 
         if ((DeviceSpeed == EFI_USB_SPEED_HIGH) || (DeviceSpeed == EFI_USB_SPEED_SUPER)) {
-          InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+          InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
           InputContext->EP[Dci-1].MaxESITPayload   = 0x0002;
           InputContext->EP[Dci-1].MaxBurstSize     = 0x0;
           InputContext->EP[Dci-1].CErr             = 3;
@@ -3318,7 +3386,7 @@ XhcInitializeEndpointContext64 (
           InputContext->EP[Dci-1].EPType = ED_BULK_OUT;
         }
 
-        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
         if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
           EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
           Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
@@ -3342,14 +3410,46 @@ XhcInitializeEndpointContext64 (
           InputContext->EP[Dci-1].EPType = ED_ISOCH_OUT;
         }
 
-        InputContext->EP[Dci-1].Interval = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].Interval         = CalculateInterval (USB_ENDPOINT_ISO, DeviceSpeed, EpDesc->Interval);
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
 
         //
-        // Do not support isochronous transfer now.
+        // Bits 10:0 of wMaxPacketSize hold the packet size.
+        // For high-speed endpoints bits 12:11 additionally hold
+        // the number of additional transaction opportunities per microframe.
         //
-        DEBUG ((DEBUG_INFO, "XhcInitializeEndpointContext64: Unsupport ISO EP found, Transfer ring is not allocated.\n"));
-        EpDesc = (USB_ENDPOINT_DESCRIPTOR *)((UINTN)EpDesc + EpDesc->Length);
-        continue;
+        InputContext->EP[Dci-1].MaxPacketSize  = EpDesc->MaxPacketSize & USB_MAX_PACKET_PAYLOAD_SIZE;
+        InputContext->EP[Dci-1].MaxBurstSize   = (EpDesc->MaxPacketSize & USB_MAX_PACKET_MULT_TRANSACTIONS) >> 11;
+        InputContext->EP[Dci-1].MaxESITPayload = InputContext->EP[Dci-1].MaxPacketSize *
+                                                 (InputContext->EP[Dci-1].MaxBurstSize + 1);
+
+        if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] == NULL) {
+          EndpointTransferRing                                   = AllocateZeroPool (sizeof (TRANSFER_RING));
+          Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1] = (VOID *)EndpointTransferRing;
+          CreateTransferRing (Xhc, TR_RING_TRB_NUMBER, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]);
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Created ISO ring [%p~%p) with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        } else {
+          EndpointTransferRing = (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1];
+          XhcReinitializeTransferRing (Xhc, EndpointTransferRing);
+
+          DEBUG ((
+            DEBUG_INFO,
+            "Endpoint[%x]: Reuse existing ring [%p~%p) for ISO EP with ring at 0x%p\n",
+            EpDesc->EndpointAddress,
+            EndpointTransferRing->RingSeg0,
+            (UINTN)EndpointTransferRing->RingSeg0 + TR_RING_TRB_NUMBER * sizeof (TRB_TEMPLATE),
+            Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci-1]
+            ));
+        }
+
+        break;
       case USB_ENDPOINT_INTERRUPT:
         if (Direction == EfiUsbDataIn) {
           InputContext->EP[Dci-1].CErr   = 3;
@@ -3359,12 +3459,12 @@ XhcInitializeEndpointContext64 (
           InputContext->EP[Dci-1].EPType = ED_INTERRUPT_OUT;
         }
 
-        InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+        InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
         InputContext->EP[Dci-1].MaxESITPayload   = EpDesc->MaxPacketSize;
         InputContext->EP[Dci-1].Interval         = CalculateInterval (USB_ENDPOINT_INTERRUPT, DeviceSpeed, EpDesc->Interval);
 
         if ((DeviceSpeed == EFI_USB_SPEED_HIGH) || (DeviceSpeed == EFI_USB_SPEED_SUPER)) {
-          InputContext->EP[Dci-1].AverageTRBLength = 0x1000;
+          InputContext->EP[Dci-1].AverageTRBLength = XHC_DEFAULT_AVERAGE_TRB_LENGTH;
           InputContext->EP[Dci-1].MaxESITPayload   = 0x0002;
           InputContext->EP[Dci-1].MaxBurstSize     = 0x0;
           InputContext->EP[Dci-1].CErr             = 3;
