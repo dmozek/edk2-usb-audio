@@ -1338,6 +1338,45 @@ XhciBurstWrapperAbandon (
 }
 
 /**
+  Remove every URB whose transfer-ring pointer matches Ring from Xhc->AsyncTransfers,
+  and free each.
+
+  @param  Xhc   The XHCI instance whose async list to prune.
+  @param  Ring  The transfer ring whose URBs to drop.
+**/
+VOID
+XhcRemoveAsyncTransfersForRing (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN TRANSFER_RING      *Ring
+  )
+{
+  LIST_ENTRY  *Entry;
+  LIST_ENTRY  *Next;
+  URB         *CheckedUrb;
+
+  if (Ring == NULL) {
+    return;
+  }
+
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
+    CheckedUrb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
+
+    if (CheckedUrb->Ring != Ring) {
+      continue;
+    }
+
+    if (CheckedUrb->Callback == XhciBurstWrapperCallback) {
+      XhciBurstWrapperAbandon ((URB_BURST *)CheckedUrb->Context);
+      CheckedUrb->Callback = NULL;
+      CheckedUrb->Context  = NULL;
+    }
+
+    RemoveEntryList (&CheckedUrb->UrbList);
+    XhcFreeUrb (Xhc, CheckedUrb);
+  }
+}
+
+/**
   Reinitialize an already-allocated transfer ring without releasing its
   memory.
 
@@ -1355,6 +1394,8 @@ XhcReinitializeTransferRing (
 
   ASSERT (Ring != NULL);
   ASSERT (Ring->RingSeg0 != NULL);
+
+  XhcRemoveAsyncTransfersForRing (Xhc, Ring);
 
   ZeroMem (Ring->RingSeg0, sizeof (TRB_TEMPLATE) * Ring->TrbNumber);
   Ring->RingEnqueue = (TRB_TEMPLATE *)Ring->RingSeg0;
@@ -3069,6 +3110,7 @@ XhcDisableSlotCmd (
   //
   for (Index = 0; Index < 31; Index++) {
     if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index] != NULL) {
+      XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index]);
       RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index])->RingSeg0;
       if (RingSeg != NULL) {
         UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -3182,6 +3224,7 @@ XhcDisableSlotCmd64 (
   //
   for (Index = 0; Index < 31; Index++) {
     if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index] != NULL) {
+      XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index]);
       RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Index])->RingSeg0;
       if (RingSeg != NULL) {
         UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -4190,6 +4233,7 @@ XhcSetInterface (
       // 2) Free Transfer Rings of all endpoints that will be affected by the Alternate Interface setting.
       //
       if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1] != NULL) {
+        XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1]);
         RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1])->RingSeg0;
         if (RingSeg != NULL) {
           UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
@@ -4397,6 +4441,7 @@ XhcSetInterface64 (
       // 2) Free Transfer Rings of all endpoints that will be affected by the Alternate Interface setting.
       //
       if (Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1] != NULL) {
+        XhcRemoveAsyncTransfersForRing (Xhc, (TRANSFER_RING *)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1]);
         RingSeg = ((TRANSFER_RING *)(UINTN)Xhc->UsbDevContext[SlotId].EndpointTransferRing[Dci - 1])->RingSeg0;
         if (RingSeg != NULL) {
           UsbHcFreeMem (Xhc->MemPool, RingSeg, sizeof (TRB_TEMPLATE) * TR_RING_TRB_NUMBER);
