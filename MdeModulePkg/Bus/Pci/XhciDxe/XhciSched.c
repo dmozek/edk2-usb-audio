@@ -1198,7 +1198,7 @@ IsTransferRingTrb (
 
 **/
 BOOLEAN
-IsAsyncIntTrb (
+IsAsyncTrb (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  TRB_TEMPLATE       *Trb,
   OUT URB                **Urb
@@ -1208,7 +1208,7 @@ IsAsyncIntTrb (
   LIST_ENTRY  *Next;
   URB         *CheckedUrb;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     CheckedUrb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
     if (IsTransferRingTrb (Xhc, Trb, CheckedUrb)) {
       *Urb = CheckedUrb;
@@ -1352,7 +1352,7 @@ XhcCheckUrbResult (
       CheckedUrb = Xhc->PendingUrb;
     } else if (IsTransferRingTrb (Xhc, TRBPtr, Urb)) {
       CheckedUrb = Urb;
-    } else if (IsAsyncIntTrb (Xhc, TRBPtr, &AsyncUrb)) {
+    } else if (IsAsyncTrb (Xhc, TRBPtr, &AsyncUrb)) {
       CheckedUrb = AsyncUrb;
     } else {
       continue;
@@ -1562,8 +1562,8 @@ XhcExecTransfer (
 }
 
 /**
-  Delete a single asynchronous interrupt transfer for
-  the device and endpoint.
+  Delete a single asynchronous interrupt or isochronous
+  transfer for the device and endpoint.
 
   @param  Xhc                   The XHCI Instance.
   @param  BusAddr               The logical device address assigned by UsbBus driver.
@@ -1574,7 +1574,7 @@ XhcExecTransfer (
 
 **/
 EFI_STATUS
-XhciDelAsyncIntTransfer (
+XhciDelAsyncTransfer (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  UINT8              BusAddr,
   IN  UINT8              EpNum
@@ -1592,7 +1592,7 @@ XhciDelAsyncIntTransfer (
 
   Urb = NULL;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
     if ((Urb->Ep.BusAddr == BusAddr) &&
         (Urb->Ep.EpAddr == EpNum) &&
@@ -1626,13 +1626,13 @@ XhciDelAsyncIntTransfer (
 }
 
 /**
-  Remove all the asynchronous interrutp transfers.
+  Remove all the asynchronous interrupt and isochronous transfers.
 
   @param  Xhc    The XHCI Instance.
 
 **/
 VOID
-XhciDelAllAsyncIntTransfers (
+XhciDelAllAsyncTransfers (
   IN USB_XHCI_INSTANCE  *Xhc
   )
 {
@@ -1642,7 +1642,7 @@ XhciDelAllAsyncIntTransfers (
   VOID        *UrbData;
   EFI_STATUS  Status;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
 
     //
@@ -1651,7 +1651,7 @@ XhciDelAllAsyncIntTransfers (
     //
     Status = XhcDequeueTrbFromEndpoint (Xhc, Urb);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "XhciDelAllAsyncIntTransfers: XhcDequeueTrbFromEndpoint failed\n"));
+      DEBUG ((DEBUG_ERROR, "XhciDelAllAsyncTransfers: XhcDequeueTrbFromEndpoint failed\n"));
     }
 
     RemoveEntryList (&Urb->UrbList);
@@ -1668,12 +1668,12 @@ XhciDelAllAsyncIntTransfers (
 }
 
 /**
-  Insert a single asynchronous interrupt transfer for
+  Insert a single asynchronous interrupt or isochronous transfer for
   the device and endpoint.
 
   @param Xhc            The XHCI Instance
   @param BusAddr        The logical device address assigned by UsbBus driver
-  @param EpAddr         Endpoint addrress
+  @param EpAddr         Endpoint address
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
   @param DataLen        The length of data buffer
@@ -1684,7 +1684,7 @@ XhciDelAllAsyncIntTransfers (
 
 **/
 URB *
-XhciInsertAsyncIntTransfer (
+XhciInsertAsyncTransfer (
   IN USB_XHCI_INSTANCE                *Xhc,
   IN UINT8                            BusAddr,
   IN UINT8                            EpAddr,
@@ -1725,9 +1725,9 @@ XhciInsertAsyncIntTransfer (
 
   //
   // New asynchronous transfer must inserted to the head.
-  // Check the comments in XhcMoniteAsyncRequests
+  // Check the comments in XhcMonitorAsyncRequests
   //
-  InsertHeadList (&Xhc->AsyncIntTransfers, &Urb->UrbList);
+  InsertHeadList (&Xhc->AsyncTransfers, &Urb->UrbList);
 
   return Urb;
 }
@@ -1842,7 +1842,7 @@ XhcMonitorAsyncRequests (
 
   Xhc = (USB_XHCI_INSTANCE *)Context;
 
-  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncIntTransfers) {
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
     //
     // Save values passed into the callback.
     // `XhcUpdateAsyncRequest` must be called before the callback

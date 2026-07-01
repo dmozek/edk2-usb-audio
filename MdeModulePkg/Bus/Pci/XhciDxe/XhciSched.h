@@ -868,8 +868,8 @@ XhcExecTransfer (
   );
 
 /**
-  Delete a single asynchronous interrupt transfer for
-  the device and endpoint.
+  Delete a single asynchronous interrupt or isochronous
+  transfer for the device and endpoint.
 
   @param  Xhc                   The XHCI Instance.
   @param  BusAddr               The logical device address assigned by UsbBus driver.
@@ -880,30 +880,30 @@ XhcExecTransfer (
 
 **/
 EFI_STATUS
-XhciDelAsyncIntTransfer (
+XhciDelAsyncTransfer (
   IN  USB_XHCI_INSTANCE  *Xhc,
   IN  UINT8              BusAddr,
   IN  UINT8              EpNum
   );
 
 /**
-  Remove all the asynchronous interrupt transfers.
+  Remove all the asynchronous interrupt and isochronous transfers.
 
   @param  Xhc                   The XHCI Instance.
 
 **/
 VOID
-XhciDelAllAsyncIntTransfers (
+XhciDelAllAsyncTransfers (
   IN USB_XHCI_INSTANCE  *Xhc
   );
 
 /**
-  Insert a single asynchronous interrupt transfer for
+  Insert a single asynchronous interrupt or isochronous transfer for
   the device and endpoint.
 
   @param Xhc            The XHCI Instance
   @param BusAddr        The logical device address assigned by UsbBus driver
-  @param EpAddr         Endpoint addrress
+  @param EpAddr         Endpoint address
   @param DevSpeed       The device speed
   @param MaxPacket      The max packet length of the endpoint
   @param DataLen        The length of data buffer
@@ -914,7 +914,7 @@ XhciDelAllAsyncIntTransfers (
 
 **/
 URB *
-XhciInsertAsyncIntTransfer (
+XhciInsertAsyncTransfer (
   IN USB_XHCI_INSTANCE                *Xhc,
   IN UINT8                            BusAddr,
   IN UINT8                            EpAddr,
