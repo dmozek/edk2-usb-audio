@@ -1227,3 +1227,224 @@ FreeFormatInfo (
     FreePool (Formats);
   }
 }
+
+/**
+  Derive the isochronous packet pacing of the stream for the selected format.
+
+  One packet is sent per endpoint service interval.
+
+  @param[in]     Dev     The USB audio device context (spec version).
+  @param[in,out] Stream  The stream context.
+
+  @retval EFI_SUCCESS      Pacing derived.
+  @retval EFI_UNSUPPORTED  The sample rate needs more bytes per service
+                           interval than the endpoint's max packet size.
+**/
+STATIC
+EFI_STATUS
+ComputeStreamPacing (
+  IN     USB_AUDIO_DEV         *Dev,
+  IN OUT USB_AUDIO_STREAM_CTX  *Stream
+  )
+{
+  UINTN  FrameSize;
+  UINTN  Interval;
+  UINTN  IntervalsPerSecond;
+  UINTN  MaxFramesPerInterval;
+  UINTN  PacketsPerPumpPeriod;
+
+  FrameSize = MAX (1u, (UINTN)Stream->DeviceChannels * Stream->DeviceSubframeSize);
+
+  Interval = MAX (1u, (UINTN)Stream->Interval);
+  if (Dev->SpecVersion == UsbAudioSpec20) {
+    IntervalsPerSecond = 8000u >> (MIN (Interval, 14u) - 1);
+  } else {
+    IntervalsPerSecond = 1000u / Interval;
+  }
+
+  IntervalsPerSecond = MAX (IntervalsPerSecond, 1u);
+
+  MaxFramesPerInterval = (Stream->DeviceSampleRateHz + IntervalsPerSecond - 1) / IntervalsPerSecond;
+
+  Stream->IntervalsPerSecond = IntervalsPerSecond;
+  Stream->MaxFramesPerPacket = ((UINTN)Stream->MaxPacketSize & 0x7FF) / FrameSize;
+
+  if (MaxFramesPerInterval > Stream->MaxFramesPerPacket) {
+    DEBUG ((
+      DEBUG_ERROR,
+      "UsbAudioDxe: %u Hz needs %u frames per service interval, endpoint packet holds only %u\n",
+      Stream->DeviceSampleRateHz,
+      MaxFramesPerInterval,
+      Stream->MaxFramesPerPacket
+      ));
+    return EFI_UNSUPPORTED;
+  }
+
+  //
+  // Keep USB_AUDIO_PUMP_PERIODS of packets queued so the ring stays fed across
+  // late timer ticks
+  //
+  PacketsPerPumpPeriod = MAX (1u, (IntervalsPerSecond * USB_AUDIO_TRANSFER_SLOT_INTERVAL_MS) / 1000u);
+
+  Stream->TargetInFlight = MIN (USB_AUDIO_PUMP_PERIODS * PacketsPerPumpPeriod, (UINTN)USB_AUDIO_TRANSFER_SLOT_COUNT);
+
+  DEBUG ((
+    DEBUG_INFO,
+    "UsbAudioDxe: pacing: %u service intervals/s, <=%u frames/packet, %u packets in flight\n",
+    Stream->IntervalsPerSecond,
+    Stream->MaxFramesPerPacket,
+    Stream->TargetInFlight
+    ));
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Select a specific audio format for the USB audio device.
+
+  @param[in]  ControlUsbIo          The audio control USB I/O protocol instance.
+  @param[in]  AgentHandle           The handle of the agent requesting the format selection.
+  @param[in]  Formats               The array of supported audio formats.
+  @param[in]  SelectedFormatIndex   The index of the format to select.
+  @param[in]  SampleRateHz          The desired sample rate in Hz.
+  @param[in,out] Dev                The USB audio device context to update with the selected format.
+
+  @retval EFI_SUCCESS           The format was successfully selected.
+  @retval EFI_INVALID_PARAMETER The selected format index is out of range or the sample rate is not supported by the selected format.
+  @retval EFI_DEVICE_ERROR      An error occurred while stopping the audio stream or configuring the device for the selected format.
+  @retval EFI_OUT_OF_RESOURCES  Insufficient resources to complete the operation.
+**/
+EFI_STATUS
+UsbAudioSelectFormat (
+  IN EFI_USB_IO_PROTOCOL    *ControlUsbIo,
+  IN EFI_HANDLE             AgentHandle,
+  IN USB_AUDIO_FORMAT_INFO  *Formats,
+  IN UINTN                  SelectedFormatIndex,
+  IN UINT32                 SampleRateHz,
+  IN OUT USB_AUDIO_DEV      *Dev
+  )
+{
+  USB_AUDIO_STREAM_CTX   *Stream;
+  EFI_STATUS             Status;
+  USB_AUDIO_FORMAT_INFO  *SelectedFormat;
+  EFI_TPL                OldTpl;
+
+  ASSERT (ControlUsbIo != NULL);
+  ASSERT (Formats != NULL);
+  ASSERT (Dev != NULL);
+
+  if ((SelectedFormatIndex >= Dev->SupportedFormatCount) ||
+      (SampleRateHz < Formats[SelectedFormatIndex].Info.MinSampleRateHz)  ||
+      (SampleRateHz > Formats[SelectedFormatIndex].Info.MaxSampleRateHz))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Stream = &Dev->Stream;
+  ASSERT (Stream != NULL);
+
+  if (!StopAudio (Dev)) {
+    DEBUG ((DEBUG_ERROR, "UsbAudioDxe: Failed to drain audio stream\n"));
+    return EFI_DEVICE_ERROR;
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_AUDIO_TPL);
+
+  SelectedFormat = &Formats[SelectedFormatIndex];
+
+  Stream->InterfaceNumber     = SelectedFormat->InternalInfo.InterfaceNumber;
+  Stream->EndpointAddr        = SelectedFormat->InternalInfo.EndpointAddr;
+  Stream->MaxPacketSize       = SelectedFormat->InternalInfo.MaxPacketSize;
+  Stream->Interval            = SelectedFormat->InternalInfo.Interval;
+  Stream->DeviceSampleRateHz  = SampleRateHz;
+  Stream->DeviceChannels      = SelectedFormat->Info.Channels;
+  Stream->DeviceSubframeSize  = SelectedFormat->Info.SubslotSize;
+  Stream->DeviceBitResolution = SelectedFormat->Info.BitsPerSample;
+  Stream->DeviceFormatTag     = SelectedFormat->FormatTag;
+  Dev->FormatValid            = FALSE;
+  Dev->FeatureUnitId          = SelectedFormat->InternalInfo.FeatureUnitId;
+  Dev->VolumeControlMask      = SelectedFormat->InternalInfo.VolumeControlMask;
+  Dev->MuteControlMask        = SelectedFormat->InternalInfo.MuteControlMask;
+
+  Status = ComputeStreamPacing (Dev, Stream);
+
+  gBS->RestoreTPL (OldTpl);
+
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (Dev->Stream.AsHandle != NULL) {
+    gBS->CloseProtocol (
+           Dev->Stream.AsHandle,
+           &gEfiUsbIoProtocolGuid,
+           AgentHandle,
+           Dev->ControllerHandle
+           );
+  }
+
+  Status = OpenAudioStreamIo (Dev, AgentHandle);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = InitStreams (Stream);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "UsbAudioDxe: InitStreams failed: %r\n", Status));
+    return Status;
+  }
+
+  Status = UsbAudioSetInterface (Stream->UsbIo, Stream->InterfaceNumber, SelectedFormat->InternalInfo.AltSetting);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "UsbAudioDxe: SET_INTERFACE alt %u failed: %r\n", SelectedFormat->InternalInfo.AltSetting, Status));
+    return Status;
+  }
+
+  if (SelectedFormat->FrequencyControlSupported) {
+    if (Dev->SpecVersion == UsbAudioSpec20) {
+      if (SelectedFormat->InternalInfo.ClockSourceId != 0 ) {
+        Status = UsbAudio20SetSampleRate (ControlUsbIo, Dev->AcInterfaceNumber, SelectedFormat->InternalInfo.ClockSourceId, SampleRateHz);
+      }
+    } else {
+      Status = UsbAudio10SetSampleRate (ControlUsbIo, SelectedFormat->InternalInfo.EndpointAddr, SampleRateHz);
+    }
+
+    if (EFI_ERROR (Status)) {
+      DEBUG ((
+        DEBUG_WARN,
+        "UsbAudioDxe: set sample rate %u failed: %r (continuing)\n",
+        SampleRateHz,
+        Status
+        ));
+      Status = EFI_SUCCESS;
+    }
+  } else {
+    DEBUG ((DEBUG_INFO, "UsbAudioDxe: Selected format doesn't support frequency control, skipping sample rate set\n"));
+  }
+
+  OldTpl = gBS->RaiseTPL (USB_AUDIO_TPL);
+
+  Dev->FormatValid        = TRUE;
+  Dev->Format->Format     = (UINT32)SelectedFormatIndex;
+  Dev->Format->Info       = &SelectedFormat->Info;
+  Dev->CurrentFormatIndex = SelectedFormatIndex;
+
+  gBS->RestoreTPL (OldTpl);
+
+  return Status;
+}
+
+/**
+  Get the size of the current audio frame in bytes.
+
+  @param[in]  Dev  The USB audio device context.
+
+  @return The size of the current audio frame in bytes, but not less than 1.
+**/
+UINTN
+GetCurrentFrameSize (
+  IN USB_AUDIO_DEV  *Dev
+  )
+{
+  return MAX (1, Dev->Stream.DeviceChannels * Dev->Stream.DeviceSubframeSize);
+}
