@@ -129,7 +129,7 @@ struct _USB_AUDIO_STREAM_CTX {
   UINT8                      DeviceBitResolution;
   UINT16                     DeviceFormatTag; /* UAC1 wFormatTag or 0 for UAC2 PCM */
 
-  /* Packet pacing */
+  /* Packet pacing: one isochronous packet is sent per endpoint service interval */
   UINTN                      IntervalsPerSecond;
   UINTN                      MaxFramesPerPacket;
   UINTN                      RateCarry;
