@@ -1,0 +1,47 @@
+## @file
+#  A simple test application supporting raw PCM file playback
+#  and a set of test sequences using generated sawtooth waveforms.
+#
+#  Copyright (c) 2026, David Mozek. All rights reserved.<BR>
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = AudioPlaybackTest
+  FILE_GUID                      = 9088e7be-2ad1-44b9-a961-8fc9fb70ecb6
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  Playback.h
+  Playback.c
+  PlaybackTest.h
+  PlaybackTest.c
+  FormatSelect.c
+  FormatSelect.h
+  Menu.h
+  Menu.c
+  NoUiTest.h
+  NoUiTest.c
+  AudioPlaybackTest.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  BaseLib
+  UefiApplicationEntryPoint
+  UefiLib
+  UefiBootServicesTableLib
+  MemoryAllocationLib
+  PrintLib
+
+[Protocols]
+  gEdkiiAudioOutputProtocolGuid           ## CONSUMES
+  gEdkiiAudioCodecProtocolGuid            ## CONSUMES
+  gEfiShellProtocolGuid                   ## CONSUMES
+  gEfiShellParametersProtocolGuid         ## CONSUMES
