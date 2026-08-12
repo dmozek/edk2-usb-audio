@@ -429,6 +429,18 @@ UsbSelectConfig (
 
     ASSERT (Index < USB_MAX_INTERFACE);
     Device->Interfaces[Index] = UsbIf;
+  }
+
+  Device->NumOfInterface = Index;
+
+  //
+  // Connect device drivers for each interface.
+  // Some device classes, such as the USB audio device class
+  // may require all interfaces to be enumerated before the driver can
+  // be connected successfully.
+  //
+  for (Index = 0; Index < Device->NumOfInterface; Index++) {
+    UsbIf = Device->Interfaces[Index];
 
     //
     // Connect the device to drivers, if it failed, ignore
@@ -445,8 +457,6 @@ UsbSelectConfig (
         ));
     }
   }
-
-  Device->NumOfInterface = Index;
 
   return EFI_SUCCESS;
 }
