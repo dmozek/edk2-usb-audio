@@ -1,0 +1,15 @@
+// /** @file
+// USB Audio Class DXE driver - supports UAC 1.0 and UAC 2.0 devices.
+//
+// Consumes USB I/O Protocol and produces EFI_AUDIO_CODEC_PROTOCOL and EFI_AUDIO_OUTPUT_PROTOCOL,
+// providing asynchronous PCM playback, volume and format control for USB Audio Class devices.
+//
+// Copyright (c) 2026, David Mozek. All rights reserved.<BR>
+//
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+//
+// **/
+
+#string STR_MODULE_ABSTRACT    #language en-US "USB Audio Class DXE driver"
+
+#string STR_MODULE_DESCRIPTION #language en-US "Manages USB Audio Class 1.0 and 2.0 devices. Produces EFI_AUDIO_CODEC_PROTOCOL and EFI_AUDIO_OUTPUT_PROTOCOL, providing asynchronous PCM playback, volume and format control for USB Audio Class devices."

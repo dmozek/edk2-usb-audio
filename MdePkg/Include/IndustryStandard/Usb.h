@@ -37,6 +37,14 @@
 #define USB_MASS_STORE_BOT   0x50    ///< Bulk-Only Transport
 
 //
+// USB 2.0 wMaxPacketSize bits
+// Bits 0-10 are the maximum payload size per transaction
+// Bits 11-12 are the number of transactions per microframe
+//
+#define USB_MAX_PACKET_PAYLOAD_SIZE       0x07FF
+#define USB_MAX_PACKET_MULT_TRANSACTIONS  0x1800
+
+//
 // Standard device request and request type
 // USB 2.0 spec, Section 9.4
 //

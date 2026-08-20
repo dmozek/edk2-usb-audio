@@ -205,10 +205,9 @@ XhcReset (
       }
 
       //
-      // Clean up the asynchronous transfers, currently only
-      // interrupt supports asynchronous operation.
+      // Clean up the asynchronous interrupt and isochronous transfers.
       //
-      XhciDelAllAsyncIntTransfers (Xhc);
+      XhciDelAllAsyncTransfers (Xhc);
       XhcFreeSched (Xhc);
 
       XhcInitSched (Xhc);
@@ -782,7 +781,7 @@ XhcTransfer (
   EFI_STATUS  RecoveryStatus;
   URB         *Urb;
 
-  ASSERT ((Type == XHC_CTRL_TRANSFER) || (Type == XHC_BULK_TRANSFER) || (Type == XHC_INT_TRANSFER_SYNC));
+  ASSERT ((Type == XHC_CTRL_TRANSFER) || (Type == XHC_BULK_TRANSFER) || (Type == XHC_INT_TRANSFER_SYNC) || (Type == XHC_ISO_TRANSFER_SYNC));
   Urb = XhcCreateUrb (
           Xhc,
           DeviceAddress,
@@ -1444,7 +1443,7 @@ XhcAsyncInterruptTransfer (
       goto ON_EXIT;
     }
 
-    Status = XhciDelAsyncIntTransfer (Xhc, DeviceAddress, EndPointAddress);
+    Status = XhciDelAsyncTransfer (Xhc, DeviceAddress, EndPointAddress);
     DEBUG ((DEBUG_INFO, "XhcAsyncInterruptTransfer: remove old transfer for addr %d, Status = %r\n", DeviceAddress, Status));
     goto ON_EXIT;
   }
@@ -1465,13 +1464,17 @@ XhcAsyncInterruptTransfer (
     goto ON_EXIT;
   }
 
-  Urb = XhciInsertAsyncIntTransfer (
+  Urb = XhciInsertAsyncTransfer (
           Xhc,
           DeviceAddress,
           EndPointAddress,
           DeviceSpeed,
           MaximumPacketLength,
+          XHC_INT_TRANSFER_ASYNC,
+          NULL,
           DataLength,
+          0,
+          FALSE,
           CallBackFunction,
           Context
           );
@@ -1605,6 +1608,130 @@ ON_EXIT:
 }
 
 /**
+  Check if the USB speed supports isochronous transfers.
+
+  @param  DeviceSpeed  The USB speed of the device.
+
+  @return TRUE if the USB speed supports isochronous transfers, FALSE otherwise.
+ **/
+STATIC
+BOOLEAN
+XhcDeviceSupportsIsochronousTransfers (
+  IN UINT8  DeviceSpeed
+  )
+{
+  return (DeviceSpeed == EFI_USB_SPEED_FULL) ||
+         (DeviceSpeed == EFI_USB_SPEED_HIGH) ||
+         (DeviceSpeed == EFI_USB_SPEED_SUPER);
+}
+
+/**
+  Check if the maximum packet length is valid for isochronous transfer.
+
+  @param  DeviceSpeed          The USB speed of the device.
+  @param  MaximumPacketLength  The maximum packet length to check.
+
+  @retval TRUE The maximum packet length is valid.
+  @retval FALSE The maximum packet length is not valid.
+ **/
+STATIC
+BOOLEAN
+XhcMaxIsochronousPacketLengthIsValid (
+  IN UINT8  DeviceSpeed,
+  IN UINTN  MaximumPacketLength
+  )
+{
+  UINTN  MaxPacketLengthLimit;
+
+  switch (DeviceSpeed) {
+    case EFI_USB_SPEED_FULL:
+      MaxPacketLengthLimit = 1023;
+      break;
+    case EFI_USB_SPEED_HIGH:
+      MaxPacketLengthLimit = 1024;
+      break;
+    case EFI_USB_SPEED_SUPER:
+      MaxPacketLengthLimit = 1024;
+      break;
+    default:
+      return FALSE;
+  }
+
+  if ((MaximumPacketLength == 0) ||
+      (MaximumPacketLength > MaxPacketLengthLimit))
+  {
+    return FALSE;
+  } else {
+    return TRUE;
+  }
+}
+
+/**
+  Get the time occupied by a (micro)frame for isochronous transfer.
+
+  @param  DeviceSpeed  The USB speed of the device.
+
+  @return The time occupied by a (micro)frame in microseconds.
+ **/
+STATIC
+UINTN
+XhcIsochronousFrameTime (
+  IN UINT8  DeviceSpeed
+  )
+{
+  //
+  // Time occupied by a (micro)frame is 1ms for full speed device, 125us for high speed and super speed device.
+  //
+  switch (DeviceSpeed) {
+    case EFI_USB_SPEED_FULL:
+      return 1000;
+    case EFI_USB_SPEED_HIGH:
+    case EFI_USB_SPEED_SUPER:
+      return 125;
+    default:
+      return 0;
+  }
+}
+
+/**
+  Get the interval of the endpoint from the device context and compute the interval (micro)frames.
+
+  @param  Xhc              The pointer to the USB_XHCI_INSTANCE.
+  @param  SlotId           The slot ID of the device.
+  @param  EndPointAddress  The endpoint address with its direction.
+
+  @return The interval in (micro)frames.
+ **/
+STATIC
+UINT32
+XhcGetInterval (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN UINT8              SlotId,
+  IN UINT8              EndPointAddress
+  )
+{
+  UINT32  Interval;
+  UINT8   Dci;
+
+  Dci = XhcEndpointToDci (EndPointAddress, (UINT8)(((EndPointAddress & 0x80) != 0) ? EfiUsbDataIn : EfiUsbDataOut));
+  //
+  // Read the endpoint Interval from the Device Context
+  // and shift to compute 2^(Interval)
+  //
+  if (Xhc->HcCParams.Data.Csz == 0) {
+    Interval = 1 << ((DEVICE_CONTEXT *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  } else {
+    Interval = 1 << ((DEVICE_CONTEXT_64 *)Xhc->UsbDevContext[SlotId].OutputContext)->EP[Dci-1].Interval;
+  }
+
+  if (Interval == 0) {
+    Interval = 1;
+  }
+
+  return Interval;
+}
+
+/**
   Submits isochronous transfer to a target USB device.
 
   @param  This                 This EFI_USB2_HC_PROTOCOL instance.
@@ -1622,7 +1749,12 @@ ON_EXIT:
   @param  Translator           Transaction translator to use.
   @param  TransferResult       Variable to receive the transfer result.
 
-  @return EFI_UNSUPPORTED      Isochronous transfer is unsupported.
+  @retval EFI_SUCCESS           The isochronous transfer was completed successfully.
+  @retval EFI_OUT_OF_RESOURCES  The isochronous transfer could not be submitted due to a lack of resources.
+  @retval EFI_INVALID_PARAMETER Some parameters are invalid.
+  @retval EFI_TIMEOUT           The isochronous transfer cannot be completed within the one USB frame time.
+  @retval EFI_DEVICE_ERROR      The isochronous transfer failed due to host controller or device error.
+                                Caller should check TransferResult for detailed error information.
 
 **/
 EFI_STATUS
@@ -1640,7 +1772,332 @@ XhcIsochronousTransfer (
   OUT    UINT32                              *TransferResult
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_XHCI_INSTANCE  *Xhc;
+  UINT8              SlotId;
+  EFI_STATUS         Status;
+  EFI_TPL            OldTpl;
+  UINTN              TimeoutUs;
+  UINTN              TimeoutMs;
+  UINT32             Interval;
+
+  if ((DataLength == 0) || (Data == NULL) ||
+      (TransferResult == NULL))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!XhcDeviceSupportsIsochronousTransfers (DeviceSpeed)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!XhcMaxIsochronousPacketLengthIsValid (DeviceSpeed, MaximumPacketLength)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *TransferResult = EFI_USB_ERR_SYSTEM;
+  Status          = EFI_DEVICE_ERROR;
+
+  OldTpl = gBS->RaiseTPL (XHC_TPL);
+
+  Xhc = XHC_FROM_THIS (This);
+
+  if (XhcIsHalt (Xhc) || XhcIsSysError (Xhc)) {
+    DEBUG ((DEBUG_ERROR, "XhcIsochronousTransfer: HC is halt\n"));
+    goto ON_EXIT;
+  }
+
+  SlotId = XhcBusDevAddrToSlotId (Xhc, DeviceAddress);
+  if (SlotId == 0) {
+    goto ON_EXIT;
+  }
+
+  Interval = XhcGetInterval (Xhc, SlotId, EndPointAddress);
+
+  TimeoutUs = XhcIsochronousFrameTime (DeviceSpeed) * Interval * 2;
+  TimeoutMs = (TimeoutUs + (XHC_1_MILLISECOND - 1)) / XHC_1_MILLISECOND;
+  if (TimeoutMs < XHC_SYNC_ISO_TIMEOUT_FLOOR) {
+    TimeoutMs = XHC_SYNC_ISO_TIMEOUT_FLOOR;
+  }
+
+  DEBUG ((DEBUG_VERBOSE, "XhcIsochronousTransfer: Interval = %u, Timeout = %u us (%u ms)\n", (UINT32)Interval, (UINT32)TimeoutUs, (UINT32)TimeoutMs));
+
+  Status = XhcTransfer (
+             Xhc,
+             DeviceAddress,
+             EndPointAddress,
+             DeviceSpeed,
+             MaximumPacketLength,
+             XHC_ISO_TRANSFER_SYNC,
+             NULL,
+             Data[0],
+             &DataLength,
+             TimeoutMs,
+             TransferResult
+             );
+
+ON_EXIT:
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "XhcIsochronousTransfer: error - %r, transfer - %x\n", Status, *TransferResult));
+  }
+
+  gBS->RestoreTPL (OldTpl);
+
+  return Status;
+}
+
+/**
+  Determine whether a frame number is within the [Start, End] valid scheduling
+  window modulo 2048, per XHCI 1.1 Section 4.11.2.5. The window wraps if
+  Start > End.
+
+  @param Frame   Frame number to test (must be < 2048).
+  @param Start   First frame in the window, inclusive (< 2048).
+  @param End     Last frame in the window, inclusive (< 2048).
+
+  @retval TRUE   Frame is inside the window.
+  @retval FALSE  Frame is outside the window.
+**/
+STATIC
+BOOLEAN
+FrameInWindow (
+  IN UINT32  Frame,
+  IN UINT32  Start,
+  IN UINT32  End
+  )
+{
+  if (Start <= End) {
+    return (BOOLEAN)((Frame >= Start) && (Frame <= End));
+  }
+
+  return (BOOLEAN)((Frame >= Start) || (Frame <= End));
+}
+
+/**
+  Round a microframe up to the nearest frame.
+
+  @param Microframe  The microframe number to round up.
+
+  @return The nearest frame number that is greater than or equal to the microframe.
+ **/
+STATIC
+UINTN
+RoundUpMicroframeToNearestFrame (
+  IN UINTN  Microframe
+  )
+{
+  return (Microframe + (XHC_MICROFRAMES_PER_FRAME - 1)) >> 3;
+}
+
+/**
+  Get the next frame index for scheduling an isochronous transfer.
+
+  If pending isochronous transfers exist for the same endpoint,
+  the new frame index will be after that of the last pending transfer.
+  Otherwise, the frame index will be the next available frame index
+  within the valid scheduling window.
+
+  @param  Xhc                 The pointer to the USB_XHCI_INSTANCE.
+  @param  Interval            The interval in microframes for the isochronous transfer.
+  @param  DeviceAddress       The USB device address.
+  @param  EndPointAddress     The endpoint address with its direction.
+  @param  StartFrameId        Pointer to receive the start frame ID of the valid scheduling window.
+  @param  EndFrameId          Pointer to receive the end frame ID of the valid scheduling window.
+  @param  StartOfFlow         Pointer to receive whether the returned frame starts a new
+                              isoch data flow (TRUE) or continues the pending one (FALSE).
+
+  @return The next frame index for scheduling the isochronous transfer in microframes.
+ **/
+STATIC
+UINT32
+XhcGetNextFrameIndex (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN UINT32             Interval,
+  IN UINT8              DeviceAddress,
+  IN UINT8              EndPointAddress,
+  OUT UINT32            *StartFrameId,
+  OUT UINT32            *EndFrameId,
+  OUT BOOLEAN           *StartOfFlow
+  )
+{
+  UINT32      IsochronousSchedulingThreshold;
+  UINT32      Remainder;
+  LIST_ENTRY  *Entry;
+  LIST_ENTRY  *Next;
+  URB         *Urb;
+  UINT32      LastUrbFrameId;
+  BOOLEAN     HasPendingUrb;
+  UINT32      FrameIndex;
+  UINT32      IntervalFrames;
+  UINT32      FrameId;
+
+  LastUrbFrameId = 0;
+  HasPendingUrb  = FALSE;
+
+  //
+  // Read IST and round it up to the nearest frame if it is in microframes.
+  //
+  IsochronousSchedulingThreshold = Xhc->HcSParams2.Data.Ist;
+  if (XHC_IST_IS_IN_MICROFRAMES (IsochronousSchedulingThreshold)) {
+    IsochronousSchedulingThreshold = RoundUpMicroframeToNearestFrame (IsochronousSchedulingThreshold);
+  } else {
+    IsochronousSchedulingThreshold &= 0x7;
+  }
+
+  //
+  // Check if there is any pending async isochronous transfer for the same endpoint,
+  // if yes, schedule the new transfer after the last pending transfer. The list has
+  // its newest entry at the head, so the first match is the last scheduled one.
+  //
+  BASE_LIST_FOR_EACH_SAFE (Entry, Next, &Xhc->AsyncTransfers) {
+    Urb = EFI_LIST_CONTAINER (Entry, URB, UrbList);
+    if ((Urb->Ep.Type == XHC_ISO_TRANSFER_ASYNC) &&
+        (Urb->Ep.EpAddr == EndPointAddress) &&
+        (Urb->Ep.BusAddr == DeviceAddress))
+    {
+      LastUrbFrameId = (UINT32)Urb->FrameId;
+      HasPendingUrb  = TRUE;
+      break;
+    }
+  }
+
+  //
+  // Calculate Valid Frame Window
+  // See XHCI Spec 1.1 Section 4.11.2.5.
+  // XHC_END_FRAME_OFFSET and StartFrameId are in frames; Interval is in microframes.
+  //
+  FrameIndex    = XhcReadRuntimeReg (Xhc, XHC_MFINDEX_OFFSET) >> 3;
+  *EndFrameId   = (FrameIndex + XHC_END_FRAME_OFFSET) % 2048;
+  *StartFrameId = (FrameIndex + IsochronousSchedulingThreshold + 1) % 2048;
+
+  IntervalFrames = Interval >> 3;
+  if (IntervalFrames > 1) {
+    Remainder = *StartFrameId % IntervalFrames;
+    if (Remainder != 0) {
+      *StartFrameId = (*StartFrameId + IntervalFrames - Remainder) % 2048;
+    }
+  }
+
+  if (HasPendingUrb) {
+    *StartOfFlow = FALSE;
+    FrameId      = LastUrbFrameId + Interval;
+
+    if ((FrameId >> 3) >= 2048) {
+      FrameId = FrameId % (2048 << 3);
+    }
+
+    //
+    // Continuation TDs are scheduled with SIA = 1
+    // so the FrameId is only for internal booking and not for the actual TDs.
+    //
+    if (!FrameInWindow (FrameId >> 3, *StartFrameId, *EndFrameId)) {
+      FrameId = *StartFrameId << 3;
+    }
+  } else {
+    *StartOfFlow = TRUE;
+    FrameId      = *StartFrameId << 3;
+  }
+
+  return FrameId;
+}
+
+/**
+  Increment the frame index by the specified interval, wrapping around at 2048 frames.
+
+  @param  FrameIndex  The current frame index in microframes.
+  @param  Interval    The interval to increment the frame index by in microframes.
+
+  @return The new frame index in microframes.
+ **/
+STATIC
+UINT32
+XhcIncrementFrameIndex (
+  IN UINT32  FrameIndex,
+  IN UINT32  Interval
+  )
+{
+  FrameIndex += Interval;
+  if ((FrameIndex >> 3) >= 2048) {
+    FrameIndex = FrameIndex % (2048 << 3);
+  }
+
+  return FrameIndex;
+}
+
+/**
+  Convert a microframe number to a frame number by dividing by 8.
+
+  @param  Microframe  The microframe number to convert.
+
+  @return The corresponding frame number.
+ **/
+STATIC
+UINT32
+XhcMicroFrameToFrame (
+  IN UINT32  Microframe
+  )
+{
+  return Microframe >> 3;
+}
+
+/**
+  Determine whether a microframe number is within the [Start, End] valid scheduling
+  window modulo 2048, per XHCI 1.1 Section 4.11.2.5. The window wraps if
+  Start > End.
+
+  @param Frame   Microframe number to test (must be < 2048 * 8).
+  @param Start   First frame in the window, inclusive (< 2048).
+  @param End     Last frame in the window, inclusive (< 2048).
+
+  @retval TRUE   Frame is inside the window.
+  @retval FALSE  Frame is outside the window.
+**/
+STATIC
+BOOLEAN
+MicroframeInWindow (
+  IN UINT32  Frame,
+  IN UINT32  Start,
+  IN UINT32  End
+  )
+{
+  UINT32  MicroframeInFrames;
+
+  MicroframeInFrames = XhcMicroFrameToFrame (Frame) % 2048;
+
+  return FrameInWindow (MicroframeInFrames, Start, End);
+}
+
+/**
+  Allocate and initialize a URB_BURST structure for managing a burst of isochronous transfers.
+
+  @param  TotalUrbs      The total number of URBs in the burst.
+  @param  UserContext    The user-defined context to be passed to the callback function.
+  @param  UserCallback   The callback function to be called when the transfer completes.
+
+  @return A pointer to the allocated URB_BURST structure, or NULL if allocation fails.
+ **/
+STATIC
+URB_BURST  *
+XhcCreateIsochBurst (
+  IN UINT32  TotalUrbs,
+  IN VOID    *UserContext,
+  IN VOID    *UserCallback
+  )
+{
+  URB_BURST  *Burst;
+
+  Burst = AllocateZeroPool (sizeof (URB_BURST));
+  if (Burst == NULL) {
+    return NULL;
+  }
+
+  Burst->TotalUrbs           = TotalUrbs;
+  Burst->RemainingUrbs       = TotalUrbs;
+  Burst->AggregatedCompleted = 0;
+  Burst->AggregatedResult    = EFI_USB_NOERROR;
+  Burst->UserCallback        = UserCallback;
+  Burst->UserContext         = UserContext;
+
+  return Burst;
 }
 
 /**
@@ -1663,7 +2120,11 @@ XhcIsochronousTransfer (
   @param  Context              Context passed to the call back function as
                                parameter.
 
-  @return EFI_UNSUPPORTED      Isochronous transfer isn't supported.
+  @retval EFI_SUCCESS           The asynchronous isochronous transfer request has been successfully
+                                submitted.
+  @retval EFI_OUT_OF_RESOURCES  The asynchronous isochronous transfer could not be submitted due to
+                                a lack of resources.
+  @retval EFI_INVALID_PARAMETER Some parameters are invalid.
 
 **/
 EFI_STATUS
@@ -1682,7 +2143,172 @@ XhcAsyncIsochronousTransfer (
   IN     VOID                                *Context
   )
 {
-  return EFI_UNSUPPORTED;
+  USB_XHCI_INSTANCE  *Xhc;
+  UINT8              SlotId;
+  EFI_STATUS         Status;
+  EFI_TPL            OldTpl;
+  UINT32             Interval;
+  UINTN              BytesWritten;
+  UINTN              BytesToWrite;
+  UINTN              NumTransfers;
+  UINT32             FrameId;
+  UINT32             StartFrameId;
+  UINT32             EndFrameId;
+  BOOLEAN            StartOfFlow;
+  BOOLEAN            ScheduleAsap;
+  UINT32             Index;
+  URB                *Urb;
+  URB                **Inserted;
+  UINTN              InsertedCount;
+  UINTN              RollbackIndex;
+  URB_BURST          *Burst;
+
+  Inserted      = NULL;
+  InsertedCount = 0;
+  Burst         = NULL;
+
+  if ((DataLength == 0) || (Data == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!XhcDeviceSupportsIsochronousTransfers (DeviceSpeed)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!XhcMaxIsochronousPacketLengthIsValid (DeviceSpeed, MaximumPacketLength)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (XHC_TPL);
+
+  Xhc    = XHC_FROM_THIS (This);
+  Status = EFI_SUCCESS;
+
+  if (XhcIsHalt (Xhc) || XhcIsSysError (Xhc)) {
+    DEBUG ((DEBUG_ERROR, "%a: HC is halt\n", __func__));
+    Status = EFI_DEVICE_ERROR;
+    goto ON_EXIT;
+  }
+
+  SlotId = XhcBusDevAddrToSlotId (Xhc, DeviceAddress);
+  if (SlotId == 0) {
+    Status = EFI_DEVICE_ERROR;
+    goto ON_EXIT;
+  }
+
+  NumTransfers = 1;
+  if (DataLength > MaximumPacketLength) {
+    NumTransfers = DataLength / MaximumPacketLength;
+
+    if (NumTransfers * MaximumPacketLength < DataLength) {
+      NumTransfers++;
+    }
+  }
+
+  if (NumTransfers > XHC_END_FRAME_OFFSET) {
+    DEBUG ((DEBUG_ERROR, "%a: number of transfers %u exceeds the max limit %u\n", __func__, (UINT32)NumTransfers, XHC_END_FRAME_OFFSET));
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Inserted = AllocatePool (NumTransfers * sizeof (URB *));
+  if (Inserted == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Burst = XhcCreateIsochBurst (NumTransfers, Context, IsochronousCallBack);
+  if (Burst == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Interval = XhcGetInterval (Xhc, SlotId, EndPointAddress);
+
+  FrameId = XhcGetNextFrameIndex (Xhc, Interval, DeviceAddress, EndPointAddress, &StartFrameId, &EndFrameId, &StartOfFlow);
+
+  //
+  // Only the first TD of a new isoch data flow carries an explicit Frame ID;
+  // every other TD is scheduled at the next service opportunity (SIA = 1).
+  // Later xHCI versions add the Contiguous Frame ID capability, but
+  // controllers without it may stall on Frame IDs in subsequent TDs.
+  //
+  ScheduleAsap = !StartOfFlow;
+
+  BytesWritten = 0;
+  for (Index = 0; Index < NumTransfers; Index++) {
+    if (!MicroframeInWindow (FrameId, StartFrameId, EndFrameId)) {
+      DEBUG ((DEBUG_ERROR, "%a: frame %u outside valid window [%u, %u]\n", __func__, FrameId, StartFrameId, EndFrameId));
+      Status = EFI_OUT_OF_RESOURCES;
+      goto ON_EXIT;
+    }
+
+    BytesToWrite = MIN (MaximumPacketLength, DataLength - BytesWritten);
+
+    Urb = XhciInsertAsyncTransfer (
+            Xhc,
+            DeviceAddress,
+            EndPointAddress,
+            DeviceSpeed,
+            MaximumPacketLength,
+            XHC_ISO_TRANSFER_ASYNC,
+            (UINT8 *)Data[0] + BytesWritten,
+            BytesToWrite,
+            FrameId,
+            ScheduleAsap,
+            XhciBurstWrapperCallback,
+            Burst
+            );
+
+    if (Urb == NULL) {
+      Status = EFI_OUT_OF_RESOURCES;
+      goto ON_EXIT;
+    }
+
+    ScheduleAsap = TRUE;
+    FrameId      = XhcIncrementFrameIndex (FrameId, Interval);
+
+    Inserted[InsertedCount] = Urb;
+    InsertedCount++;
+    BytesWritten += BytesToWrite;
+  }
+
+  if (Urb == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto ON_EXIT;
+  }
+
+  Status = RingIntTransferDoorBell (Xhc, Urb);
+
+ON_EXIT:
+  if (EFI_ERROR (Status) && (Inserted != NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: transfer failed, rolling back %u queued URBs\n", __func__, (UINT32)InsertedCount));
+    for (RollbackIndex = 0; RollbackIndex < InsertedCount; RollbackIndex++) {
+      Inserted[RollbackIndex]->Callback = NULL;
+      Inserted[RollbackIndex]->Context  = NULL;
+      XhcDequeueTrbFromEndpoint (Xhc, Inserted[RollbackIndex]);
+      RemoveEntryList (&Inserted[RollbackIndex]->UrbList);
+      XhcFreeUrb (Xhc, Inserted[RollbackIndex]);
+    }
+  }
+
+  if (Inserted != NULL) {
+    FreePool (Inserted);
+  }
+
+  if (EFI_ERROR (Status) && (Burst != NULL)) {
+    FreePool (Burst);
+    Burst = NULL;
+  }
+
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: error - %r\n", __func__, Status));
+  }
+
+  Xhc->PciIo->Flush (Xhc->PciIo);
+  gBS->RestoreTPL (OldTpl);
+
+  return Status;
 }
 
 /**
@@ -1839,7 +2465,7 @@ XhcCreateUsbHc (
     Xhc->Usb2Hc.MinorRevision = (ReleaseNumber & 0x0F);
   }
 
-  InitializeListHead (&Xhc->AsyncIntTransfers);
+  InitializeListHead (&Xhc->AsyncTransfers);
 
   //
   // Be caution that the Offset passed to XhcReadCapReg() should be Dword align
@@ -2285,7 +2911,7 @@ XhcDriverBindingStop (
 
   XhcHaltHC (Xhc, XHC_GENERIC_TIMEOUT);
   XhcClearBiosOwnership (Xhc);
-  XhciDelAllAsyncIntTransfers (Xhc);
+  XhciDelAllAsyncTransfers (Xhc);
   XhcFreeSched (Xhc);
 
   if (Xhc->ControllerNameTable) {

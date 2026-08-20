@@ -58,6 +58,11 @@ typedef struct _USB_DEV_CONTEXT    USB_DEV_CONTEXT;
 //
 #define XHC_GENERIC_TIMEOUT  (10 * 1000)
 //
+// Minimum timeout for synchronous isochronous transfer polling.
+// The unit is millisecond, setting it as 20ms
+//
+#define XHC_SYNC_ISO_TIMEOUT_FLOOR  (20)
+//
 // XHC reset timeout experience values.
 // The unit is millisecond, setting it as 1s.
 //
@@ -72,6 +77,20 @@ typedef struct _USB_DEV_CONTEXT    USB_DEV_CONTEXT;
 // The unit is 100us, takes 1ms as interval.
 //
 #define XHC_ASYNC_TIMER_INTERVAL  EFI_TIMER_PERIOD_MILLISECONDS(1)
+//
+// XHC isochronous transfers may not schedule a TD with a Frame ID value greater than MFINDEX + 895ms
+// Since a frame is 1 ms the unit is ms or frames
+//
+#define XHC_END_FRAME_OFFSET  895
+//
+// One frame for isocrhonous transfers is as long as 8 microframes.
+//
+#define XHC_MICROFRAMES_PER_FRAME  8
+//
+// Bit 3 of the Isochronous Scheduling Threshold (IST) field indicates whether the value is in frames or microframes.
+// If the bit is set, the value is in frames.  Otherwise, the value is in microframes.
+//
+#define XHC_IST_IS_IN_MICROFRAMES(IsochronousSchedulingThreshold)  ((IsochronousSchedulingThreshold & BIT3) == 0)
 
 //
 // XHC raises TPL to TPL_NOTIFY to serialize all its operations
@@ -216,7 +235,7 @@ struct _USB_XHCI_INSTANCE {
   //
   EFI_EVENT                   ExitBootServiceEvent;
   EFI_EVENT                   PollTimer;
-  LIST_ENTRY                  AsyncIntTransfers;
+  LIST_ENTRY                  AsyncTransfers;
 
   UINT8                       CapLength;  ///< Capability Register Length
   XHC_HCSPARAMS1              HcSParams1; ///< Structural Parameters 1

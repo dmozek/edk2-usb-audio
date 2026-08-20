@@ -1,0 +1,72 @@
+## @file
+# USB Audio Class DXE driver - supports UAC 1.0 and UAC 2.0 devices.
+#
+# Consumes USB I/O Protocol on the AudioControl interface of a USB Audio
+# Class device and produces EFI_AUDIO_OUTPUT_PROTOCOL, providing asynchronous
+# PCM playback and volume control.
+# Format selection is provided using the EFI_AUDIO_CODEC_PROTOCOL
+# produced by this driver.
+#
+# Copyright (c) 2026, David Mozek. All rights reserved.<BR>
+#
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+#
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = UsbAudioDxe
+  MODULE_UNI_FILE                = UsbAudioDxe.uni
+  FILE_GUID                      = 2D9FF696-E621-48EB-95AA-16881F2EA4A7
+  MODULE_TYPE                    = UEFI_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UsbAudioDriverBindingEntryPoint
+
+#
+#  DRIVER_BINDING   = gUsbAudioDriverBinding
+#  COMPONENT_NAME   = gUsbAudioComponentName
+#  COMPONENT_NAME2  = gUsbAudioComponentName2
+#
+
+[Sources]
+  UsbAudio.h
+  UsbAudioDxe.c
+  ComponentName.c
+  AudioCodecProtocol.c
+  AudioOutputProtocol.c
+  AudioDescriptors.h
+  AudioDescriptors.c
+  AudioDescriptors10.c
+  AudioDescriptors20.c
+  AudioRequests.h
+  AudioRequests.c
+  AudioRequests10.c
+  AudioRequests20.c
+  AudioStream.h
+  AudioStream.c
+  AudioFormats.h
+  AudioFormats.c
+  UsbAudioTypes.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  MemoryAllocationLib
+  UefiLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  BaseMemoryLib
+  UefiUsbLib
+  DebugLib
+  DevicePathLib
+
+[Protocols]
+  gEfiUsbIoProtocolGuid                  ## TO_START
+  gEfiDevicePathProtocolGuid             ## TO_START
+  gEdkiiAudioOutputProtocolGuid          ## BY_START
+  gEdkiiAudioCodecProtocolGuid           ## BY_START
+
+[UserExtensions.TianoCore."ExtraFiles"]
+  UsbAudioDxeExtra.uni
